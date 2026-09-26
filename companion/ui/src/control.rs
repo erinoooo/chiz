@@ -124,6 +124,19 @@ impl SessionTable {
     pub fn is_holder(&self, conn: u64) -> bool {
         self.live.values().any(|(_, c)| *c == conn)
     }
+
+    /// Live tablet device ids (0 or 1 entries), for status screens.
+    pub fn tablets(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.live.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Forget a tablet: drop its session slot. Returns nothing; the caller
+    /// also drops pen state and queued frames (socket reaps in <= 5 s).
+    pub fn remove_device(&mut self, device_id: &str) {
+        self.live.remove(device_id);
+    }
 }
 
 // ------------------------------------------------------------- auth rate limit (spec 12)

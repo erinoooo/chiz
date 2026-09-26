@@ -15,6 +15,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Base64
 import androidx.core.app.NotificationCompat
+import androidx.datastore.preferences.core.edit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -32,6 +33,8 @@ import xyz.chiz.tablet.proto.computePinProof
 import xyz.chiz.tablet.proto.derivePenKey
 import xyz.chiz.tablet.proto.parseStripProfile
 import xyz.chiz.tablet.proto.reconnectDelay
+import xyz.chiz.tablet.ui.SettingsKeys
+import xyz.chiz.tablet.ui.settingsStore
 import xyz.chiz.tablet.ui.MainActivity
 import java.net.InetAddress
 import java.security.MessageDigest
@@ -72,6 +75,10 @@ class ConnectionService : Service() {
     val profile: StateFlow<StripProfile?> = _profile
     private val _toggleStates = MutableStateFlow<Map<String, Boolean>>(emptyMap())
     val toggleStates: StateFlow<Map<String, Boolean>> = _toggleStates
+    private val pairingStore by lazy { PairingStore(this) }
+    private val _pairingsVersion = MutableStateFlow(0)
+    /** Incremented every time the pairing store changes; UI reloads on it. */
+    val pairingsVersion: StateFlow<Int> = _pairingsVersion
 
     val audio: AudioEngine by lazy { AudioEngine(this) }
 
@@ -89,6 +96,8 @@ class ConnectionService : Service() {
     @Volatile private var penPort = 47801
     @Volatile private var sessionId = 0L
     @Volatile private var hostAddr = ""
+    @Volatile private var pcNameSeen = ""
+    @Volatile private var portSeen = 47800
     private var pairInfo: PairInfo? = null
     private var wantStop = false
     private var panicUntil = 0L
@@ -132,6 +141,7 @@ class ConnectionService : Service() {
         pairInfo = info
         _state.value = ConnState("connecting", host, "")
         hostAddr = host
+        portSeen = port
         connectJob = scope.launch {
             var attempt = 0
             while (!wantStop && _state.value.status != "connected") {
@@ -237,6 +247,7 @@ class ConnectionService : Service() {
 
     private fun onChallenge(o: JSONObject) {
         _state.value = _state.value.copy(pairingOpen = o.optBoolean("pairing_open", false))
+        pcNameSeen = o.optString("pc_name", "")
         nonce = Base64.decode(o.getString("nonce"), Base64.DEFAULT)
         when (val info = pairInfo) {
             is PairInfo.Paired -> {
@@ -297,7 +308,29 @@ class ConnectionService : Service() {
 
     private fun onPairOk(o: JSONObject) {
         secretB64 = o.getString("device_secret")
-        // Persist via PairingStore (activity layer); fresh challenge next.
+        // Persist NOW (spec 11): otherwise the next app start has no secret
+        // and the tablet begs to pair again while the PC looks paired.
+        scope.launch {
+            try {
+                val fpHex = when (val info = pairInfo) {
+                    is PairInfo.Qr -> fpHex(info.pinnedFp)
+                    is PairInfo.Pin -> control?.observedFp?.let { fpHex(it) } ?: ""
+                    else -> ""
+                }
+                val rec = PairedPc(
+                    pcId = "$hostAddr:$portSeen",
+                    name = pcNameSeen.ifEmpty { hostAddr },
+                    fingerprintHex = fpHex,
+                    secretB64 = secretB64,
+                    hosts = listOf(hostAddr),
+                )
+                val cur = pairingStore.load().filter { it.fingerprintHex != fpHex || fpHex.isEmpty() }
+                pairingStore.save(cur + rec)
+                _pairingsVersion.value += 1
+            } catch (e: Exception) {
+                _state.value = _state.value.copy(message = "paired, but saving failed: ${e.message}")
+            }
+        }
         _state.value = _state.value.copy(message = "paired")
         phase = "wait_challenge"
     }
@@ -317,6 +350,13 @@ class ConnectionService : Service() {
         )
         phase = "connected"
         _state.value = ConnState("connected", o.optString("pc_name", hostAddr), "")
+        // Remember for auto-connect (auto device discovery).
+        scope.launch {
+            applicationContext.settingsStore.edit {
+                it[SettingsKeys.LAST_HOST] = hostAddr
+                it[SettingsKeys.LAST_PORT] = portSeen
+            }
+        }
         audio.earcon("connect")
         audio.speak("Connected to ${_state.value.pcName}")
         updateNotification()

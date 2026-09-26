@@ -24,6 +24,9 @@ object SettingsKeys {
     val ANNOUNCE_MODE = stringPreferencesKey("announce_mode") // rest|touch
     val REST_DELAY = intPreferencesKey("rest_delay") // ms, 150..600
     val SHOW_LABELS = booleanPreferencesKey("show_labels")
+    val LAST_HOST = stringPreferencesKey("last_host")
+    val LAST_PORT = intPreferencesKey("last_port")
+    val AUTO_CONNECT = booleanPreferencesKey("auto_connect")
 }
 
 object SettingsDefaults {
@@ -38,4 +41,6 @@ object SettingsDefaults {
     const val ANNOUNCE_MODE = "rest"
     const val REST_DELAY = 250
     const val SHOW_LABELS = true
+    const val LAST_PORT = 47800
+    const val AUTO_CONNECT = true
 }

@@ -166,8 +166,20 @@ impl Default for SettingsView {
     }
 }
 
+/// Button presses the GUI must execute against the runtime (the screens
+/// themselves never touch locks or the network).
+#[derive(Clone, Debug)]
+pub enum PendingAction {
+    Panic,
+    PauseToggle,
+    PairOpen,
+    ForgetTablet(String),
+    ProfileLock(Option<String>), // None = automatic
+}
+
 #[derive(Default)]
 pub struct CompanionApp {
+    pub pending: Vec<PendingAction>,
     pub screen: Screen,
     pub status: StatusView,
     pub mapping: MappingView,
@@ -204,7 +216,11 @@ impl CompanionApp {
         });
     }
 
-    fn status_ui(&self, ui: &mut egui::Ui) {
+    fn act(&mut self, a: PendingAction) {
+        self.pending.push(a);
+    }
+
+    fn status_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Status");
         let dot = if self.status.connected {
             egui::Color32::GREEN
@@ -242,6 +258,15 @@ impl CompanionApp {
         if self.status.paused {
             ui.label(egui::RichText::new("Pen input paused. Buttons keep working.").strong());
         }
+        ui.horizontal(|ui| {
+            if ui.button("Emergency release").clicked() {
+                self.act(PendingAction::Panic);
+            }
+            let pause_label = if self.status.paused { "Resume pen input" } else { "Pause pen input" };
+            if ui.button(pause_label).clicked() {
+                self.act(PendingAction::PauseToggle);
+            }
+        });
         if !self.status.banner.is_empty() {
             ui.label(egui::RichText::new(&self.status.banner).color(egui::Color32::YELLOW));
         }
@@ -319,13 +344,17 @@ impl CompanionApp {
 
     fn profiles_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Profiles");
+        if ui.button("Auto (follow active app)").clicked() {
+            self.act(PendingAction::ProfileLock(None));
+        }
         ui.horizontal(|ui| {
             for id in self.profiles.ids.clone() {
                 if ui
                     .selectable_label(self.profiles.selected.as_deref() == Some(&id), &id)
                     .clicked()
                 {
-                    self.profiles.selected = Some(id);
+                    self.profiles.selected = Some(id.clone());
+                    self.act(PendingAction::ProfileLock(Some(id)));
                 }
             }
         });
@@ -347,13 +376,15 @@ impl CompanionApp {
         }
     }
 
-    fn tablets_ui(&self, ui: &mut egui::Ui) {
+    fn tablets_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tablets");
-        for (id, name) in &self.tablets.paired {
+        ui.label("Prefer QR pairing. Use PIN pairing only on a network you trust.");
+        let paired = self.tablets.paired.clone();
+        for (id, name) in &paired {
             ui.horizontal(|ui| {
                 ui.label(format!("{name} ({id})"));
                 if ui.button("Forget").clicked() {
-                    // Wired to paired-store removal + session close in M7 runner.
+                    self.act(PendingAction::ForgetTablet(id.clone()));
                 }
             });
         }
@@ -363,7 +394,7 @@ impl CompanionApp {
                 self.tablets.countdown_s, self.tablets.pin
             ));
         } else if ui.button("Pair new tablet").clicked() {
-            // Calls open_pairing(); prefer QR, PIN only on trusted nets.
+            self.act(PendingAction::PairOpen);
         }
     }
 

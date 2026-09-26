@@ -13,7 +13,9 @@ rcgen = "0.14"
 time = "0.3"
 mdns-sd = "0.21"
 qrcodegen = "1.8"
+image = "0.25"
 egui = "0.32"
+eframe = "0.32"
 getrandom = "0.2"
 
 [dev-dependencies]

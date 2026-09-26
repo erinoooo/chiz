@@ -181,25 +181,57 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
     var found by remember { mutableStateOf<Map<String, Pair<String, Int>>>(emptyMap()) }
     var sheet by remember { mutableStateOf<String?>(null) } // qr|pin|manual
     var state by remember { mutableStateOf(ConnState()) }
+    var autoTried by remember { mutableStateOf(false) }
     val store = remember { PairingStore(ctx) }
     val discovery = remember {
         Discovery(ctx) { name, host, port -> found = found + (name to (host to port)) }
     }
 
     LaunchedEffect(Unit) {
-        paired = try {
-            store.load()
-        } catch (e: Exception) {
-            emptyList()
-        }
         discovery.start()
     }
     DisposableEffect(Unit) { onDispose { discovery.stop() } }
+    // Auto device discovery: once per screen entry, if auto-connect is on
+    // and we're idle, connect to the last PC as soon as mDNS sees it (or a
+    // paired PC's known host), using the stored secret — no taps needed.
+    LaunchedEffect(found, paired, state.status) {
+        if (autoTried || state.status == "connected" || state.status == "connecting" ||
+            state.status == "reconnecting"
+        ) {
+            return@LaunchedEffect
+        }
+        val prefs = ctx.settingsStore.data.first()
+        if (prefs[SettingsKeys.AUTO_CONNECT] == false) return@LaunchedEffect
+        val lastHost = prefs[SettingsKeys.LAST_HOST] ?: return@LaunchedEffect
+        val lastPort = prefs[SettingsKeys.LAST_PORT] ?: SettingsDefaults.LAST_PORT
+        val seen = found.values.any { (h, p) -> h == lastHost && p == lastPort }
+        val known = paired.any { pc -> lastHost in pc.hosts }
+        if (!seen && !known) return@LaunchedEffect
+        val pc = paired.firstOrNull { lastHost in it.hosts } ?: return@LaunchedEffect
+        autoTried = true
+        val id = ctx.deviceId()
+        activity.svc?.connect(
+            lastHost, lastPort, id,
+            PairInfo.Paired(pc.secretB64, hexToBytes(pc.fingerprintHex)),
+        )
+    }
     LaunchedEffect(activity.svc) {
         val s = activity.svc ?: return@LaunchedEffect
-        s.state.collect { st ->
-            state = st
-            if (st.status == "connected") onConnected()
+        launch {
+            // Reload the Keystore-backed list on every save (e.g. pair_ok).
+            s.pairingsVersion.collect {
+                paired = try {
+                    store.load()
+                } catch (e: Exception) {
+                    emptyList()
+                }
+            }
+        }
+        launch {
+            s.state.collect { st ->
+                state = st
+                if (st.status == "connected") onConnected()
+            }
         }
     }
 
@@ -626,6 +658,7 @@ fun SettingsScreen(back: () -> Unit) {
     var announce by remember { mutableStateOf(SettingsDefaults.ANNOUNCE_MODE) }
     var rest by remember { mutableStateOf(SettingsDefaults.REST_DELAY.toFloat()) }
     var labels by remember { mutableStateOf(SettingsDefaults.SHOW_LABELS) }
+    var autoConnect by remember { mutableStateOf(SettingsDefaults.AUTO_CONNECT) }
     LaunchedEffect(Unit) {
         ctx.settingsStore.data.collect { p ->
             edge = p[SettingsKeys.STRIP_EDGE] ?: edge
@@ -638,6 +671,7 @@ fun SettingsScreen(back: () -> Unit) {
             announce = p[SettingsKeys.ANNOUNCE_MODE] ?: announce
             rest = (p[SettingsKeys.REST_DELAY] ?: rest.toInt()).toFloat()
             labels = p[SettingsKeys.SHOW_LABELS] ?: labels
+            autoConnect = p[SettingsKeys.AUTO_CONNECT] ?: autoConnect
         }
     }
     fun save() = scope.launch {
@@ -652,6 +686,7 @@ fun SettingsScreen(back: () -> Unit) {
             it[SettingsKeys.ANNOUNCE_MODE] = announce
             it[SettingsKeys.REST_DELAY] = rest.toInt().coerceIn(150, 600)
             it[SettingsKeys.SHOW_LABELS] = labels
+            it[SettingsKeys.AUTO_CONNECT] = autoConnect
         }
     }
     Scaffold(topBar = {
@@ -708,6 +743,9 @@ fun SettingsScreen(back: () -> Unit) {
             }
             item { Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
                 Text("Show button labels"); Switch(labels, { labels = it; save() })
+            } }
+            item { Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+                Text("Auto-connect last PC"); Switch(autoConnect, { autoConnect = it; save() })
             } }
         }
     }

@@ -9,6 +9,7 @@
 //! timeout, or 5 failures. Outside a window: `error not_paired`.
 
 use chiz_core::{compute_pin_proof, qr, PairingWindow};
+use image::ImageEncoder;
 
 pub struct PairingState {
     pub window: PairingWindow,
@@ -74,17 +75,16 @@ impl PairingState {
     }
 }
 
-/// Render a QR URI to PBM (P4 bitmap, scale modules x4 + quiet zone 4) for
-/// the pairing screen, plus terminal ASCII for logs/tests.
-pub fn qr_pbm(uri: &str) -> Result<(Vec<u8>, String), String> {
+/// Render a QR URI to JPEG bytes (grayscale, modules x4 + quiet zone 4)
+/// for the pairing screen / saved `pair_qr.jpg`, plus terminal ASCII.
+pub fn qr_jpg(uri: &str) -> Result<(Vec<u8>, String), String> {
     use qrcodegen::{QrCode, QrCodeEcc};
     let qr = QrCode::encode_text(uri, QrCodeEcc::Medium).map_err(|e| format!("qr: {e:?}"))?;
     let n = qr.size() as usize;
     let border = 4usize;
     let scale = 4usize;
     let dim = (n + border * 2) * scale;
-    let row_bytes = dim.div_ceil(8);
-    let mut bits = vec![0u8; row_bytes * dim];
+    let mut px = vec![255u8; dim * dim];
     let mut ascii = String::new();
     for y in 0..n + border * 2 {
         let mut line = String::new();
@@ -94,17 +94,10 @@ pub fn qr_pbm(uri: &str) -> Result<(Vec<u8>, String), String> {
                 && (x - border) < n
                 && (y - border) < n
                 && qr.get_module((x - border) as i32, (y - border) as i32);
-            for _ in 0..scale {
-                if dark {
-                    let px = x * scale;
-                    let py = (y * scale) as usize;
-                    for sy in 0..scale {
-                        let yy = py + sy;
-                        let xx = px;
-                        for sx in 0..scale {
-                            let bit = 7 - ((xx + sx) % 8);
-                            bits[yy * row_bytes + (xx + sx) / 8] |= 1 << bit;
-                        }
+            if dark {
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        px[(y * scale + sy) * dim + (x * scale + sx)] = 0;
                     }
                 }
             }
@@ -113,9 +106,11 @@ pub fn qr_pbm(uri: &str) -> Result<(Vec<u8>, String), String> {
         ascii.push_str(&line);
         ascii.push('\n');
     }
-    let mut pbm = format!("P4\n{dim} {dim}\n").into_bytes();
-    pbm.extend_from_slice(&bits);
-    Ok((pbm, ascii))
+    let mut jpg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut jpg)
+        .write_image(&px, dim as u32, dim as u32, image::ExtendedColorType::L8)
+        .map_err(|e| format!("jpg: {e}"))?;
+    Ok((jpg, ascii))
 }
 
 #[cfg(test)]
@@ -176,8 +171,8 @@ mod tests {
     #[test]
     fn qr_renders_scannable_shape() {
         let uri = "chiz://pair?v=1&h=192.168.1.10&p=47800&fp=AA&t=AA";
-        let (pbm, ascii) = qr_pbm(uri).unwrap();
-        assert!(pbm.starts_with(b"P4\n"));
+        let (jpg, ascii) = qr_jpg(uri).unwrap();
+        assert_eq!(&jpg[..2], &[0xFF, 0xD8]); // JPEG SOI marker
         assert!(ascii.contains('#') && ascii.contains(' '));
         // Quiet zone: first row all light.
         assert!(ascii.lines().next().unwrap().trim().is_empty());

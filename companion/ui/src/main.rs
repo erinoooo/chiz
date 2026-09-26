@@ -14,6 +14,7 @@
 //! tray + egui screens, and QR rendering land in later slices.
 
 mod control;
+mod gui;
 mod identity;
 mod mdns;
 mod pairing;
@@ -21,7 +22,7 @@ mod pen;
 mod screens;
 mod tray;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -88,6 +89,7 @@ impl Config {
 #[derive(Default)]
 struct PairedStore {
     secrets: HashMap<String, [u8; 32]>,
+    names: HashMap<String, String>,
 }
 
 /// Constant-time equality (spec 12.2). No early exit on mismatch.
@@ -117,6 +119,7 @@ struct Shared {
     fp: [u8; 32], // own cert fingerprint: binds PIN proofs, feeds QR/mDNS
     pen_key: Mutex<HashMap<u32, ([u8; 32], String)>>, // session_id -> (key, peer ip)
     pen_rx: Mutex<HashMap<u32, PenReceiver>>,         // session_id -> receiver
+    mail: Mutex<HashMap<u64, VecDeque<Vec<u8>>>>,     // conn_id -> queued server frames
     profiles: Mutex<ProfileSet>,
     runner: Mutex<ActionRunner>,
     /// std mutex (not tokio): the OS panic-hook thread has no runtime and
@@ -176,8 +179,8 @@ fn tray_action(shared: &Arc<Shared>, item: &str) {
 /// poll loop lands with the tray UI (M6) and the stub below returns None
 /// until the platform crates wire it.
 struct ProfileSet {
-    profiles: Vec<Profile>,
-    locked: Option<String>,
+    pub profiles: Vec<Profile>,
+    pub locked: Option<String>,
 }
 
 impl ProfileSet {
@@ -524,7 +527,28 @@ async fn handle_conn<S>(
             Ok(Ok(Some(v))) => v,
             Ok(Ok(None)) => break, // EOF
             Ok(Err(_)) => break,
-            Err(_) => continue, // timeout tick: re-check deadlines
+            Err(_) => {
+                // Timeout tick: re-check deadlines + pump server frames.
+                let mut pending = vec![];
+                if let Ok(mut mail) = shared.mail.try_lock() {
+                    if let Some(q) = mail.get_mut(&conn_id) {
+                        while let Some(b) = q.pop_front() {
+                            pending.push(b);
+                        }
+                    }
+                }
+                let mut failed = false;
+                for b in pending {
+                    if stream.write_all(&b).await.is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                if (failed) {
+                    break;
+                }
+                continue;
+            }
         };
         if msg.get("t") == Some(&serde_json::Value::from("_more")) {
             continue;
@@ -568,7 +592,11 @@ async fn handle_conn<S>(
                     let mut secret = [0u8; 32];
                     os_random(&mut secret);
                     let device_name = msg.get("device_name").and_then(|v| v.as_str()).unwrap_or("tablet").to_owned();
-                    shared.paired.lock().await.secrets.insert(device_id, secret);
+                    {
+                        let mut ps = shared.paired.lock().await;
+                        ps.secrets.insert(device_id.clone(), secret);
+                        ps.names.insert(device_id, device_name.clone());
+                    }
                     drop(ps);
                     shared.pairing.lock().await.window.record_success();
                     banner(&format!("Tablet paired: {device_name}"));
@@ -632,6 +660,7 @@ async fn handle_conn<S>(
                             .lock()
                             .await
                             .insert(sid, PenReceiver::new(sid, &peer_ip.to_string()));
+                        shared.mail.lock().await.insert(conn_id, VecDeque::new());
                         let welcome = serde_json::json!({
                             "t": "welcome", "session_id": sid,
                             "pen_port": cfg.pen_port,
@@ -743,6 +772,7 @@ async fn handle_conn<S>(
     }
 
     // Session teardown: release everything, drop pen keys (spec 4).
+    shared.mail.lock().await.remove(&conn_id);
     if let Some(sid) = shared.sessions.lock().await.session_of(conn_id) {
         shared.pen_key.lock().await.remove(&sid);
         shared.pen_rx.lock().await.remove(&sid);
@@ -833,21 +863,37 @@ fn local_ipv4_hosts() -> Vec<String> {
     hosts
 }
 
+/// Push the current profile to every live tablet (manual/app switches).
+async fn broadcast_profile(shared: &Arc<Shared>, reason: &str) {
+    let msg = {
+        let ps = shared.profiles.lock().await;
+        ps.current().map(|p| profile_wire(p, reason))
+    };
+    if let Some(m) = msg {
+        if let Ok(bytes) = control::encode_frame(&m) {
+            let mut mail = shared.mail.lock().await;
+            for q in mail.values_mut() {
+                q.push_back(bytes.clone());
+            }
+        }
+    }
+}
+
 /// Open a pairing window: token + PIN, QR URI on stdout/log, PBM beside the
-/// identity, PIN for manual entry. Tray calls this on "Pair new tablet".
-async fn open_pairing(shared: &Arc<Shared>, id: &identity::Identity) {
+/// identity, PIN for manual entry. GUI/tray calls this on "Pair new tablet".
+async fn open_pairing(shared: &Arc<Shared>, fp: &[u8; 32]) {
     let (token, pin) = shared.pairing.lock().await.open(now_secs());
     let hosts = local_ipv4_hosts();
     let host_refs: Vec<&str> = hosts.iter().map(String::as_str).collect();
-    let uri = shared.pairing.lock().await.qr_uri(&host_refs, 47800, &id.fingerprint);
+    let uri = shared.pairing.lock().await.qr_uri(&host_refs, 47800, fp);
     eprintln!("pairing open for 120 s — PIN: {pin}");
     eprintln!("pairing QR: {uri}");
-    match pairing::qr_pbm(&uri) {
-        Ok((pbm, ascii)) => {
+    match pairing::qr_jpg(&uri) {
+        Ok((jpg, ascii)) => {
             eprintln!("{ascii}");
-            let path = identity::data_dir().join("pair_qr.pbm");
-            if std::fs::write(&path, &pbm).is_ok() {
-                eprintln!("QR written to {}", path.display());
+            let path = identity::data_dir().join("pair_qr.jpg");
+            if std::fs::write(&path, &jpg).is_ok() {
+                eprintln!("QR saved to {} (scan it with the tablet)", path.display());
             }
         }
         Err(e) => eprintln!("QR render failed: {e}"),
@@ -909,6 +955,7 @@ mod tests {
             fp: [0xabu8; 32],
             pen_key: Mutex::new(pen_key),
             pen_rx: Mutex::new(pen_rx),
+            mail: Mutex::new(HashMap::new()),
             profiles: Mutex::new(ProfileSet { profiles: vec![], locked: None }),
             runner: Mutex::new(ActionRunner::default()),
             failsafe: std::sync::Mutex::new(Failsafe::default()),
@@ -986,6 +1033,7 @@ async fn main() {
         fp: id.fingerprint,
         pen_key: Mutex::new(HashMap::new()),
         pen_rx: Mutex::new(HashMap::new()),
+        mail: Mutex::new(HashMap::new()),
         profiles: Mutex::new(profiles),
         runner: Mutex::new(ActionRunner::default()),
         failsafe: std::sync::Mutex::new({
@@ -1018,7 +1066,7 @@ async fn main() {
     // Pairing window (deliberate action only: tray "Pair new tablet";
     // CHIZ_PAIRING=open is the headless/test equivalent).
     if std::env::var("CHIZ_PAIRING").as_deref() == Ok("open") {
-        open_pairing(&shared, &id).await;
+        open_pairing(&shared, &id.fingerprint).await;
     }
 
     let udp = Arc::new(
@@ -1072,14 +1120,41 @@ async fn main() {
     // TLS 1.3 identity (spec 3): every control byte travels inside this
     // acceptor. No plaintext fallback (spec 12.5).
     let acceptor = tokio_rustls::TlsAcceptor::from(identity::server_config(&id).expect("tls config"));
-    loop {
-        let Ok((tcp, peer)) = listener.accept().await else {
-            continue;
-        };
-        let Ok(tls) = acceptor.accept(tcp).await else {
-            continue; // handshake failure (wrong version, junk): just close
-        };
-        let (cfg_c, sh_c) = (cfg.clone(), Arc::clone(&shared));
-        tokio::spawn(async move { handle_conn(tls, peer, cfg_c, sh_c).await });
+    let accept_shared = Arc::clone(&shared);
+    let accept_cfg = cfg.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, peer)) = listener.accept().await else {
+                continue;
+            };
+            let Ok(tls) = acceptor.accept(tcp).await else {
+                continue; // handshake failure (wrong version, junk): just close
+            };
+            let (cfg_c, sh_c) = (accept_cfg.clone(), Arc::clone(&accept_shared));
+            tokio::spawn(async move { handle_conn(tls, peer, cfg_c, sh_c).await });
+        }
+    });
+
+    if gui::headless() {
+        eprintln!("headless mode: no window (use --headless to force, unset CHIZ_HEADLESS for GUI)");
+        futures_hang().await;
+        return;
     }
+    // GUI is the default: the main window opens on launch with status,
+    // pairing (QR + PIN), profiles, mapping, pressure and settings.
+    let rt = tokio::runtime::Handle::current();
+    let gui_app = gui::GuiApp::new(rt, shared, id.fingerprint, me.clone(), cfg.control_port);
+    let opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([1024.0, 720.0]),
+        ..Default::default()
+    };
+    if let Err(e) = eframe::run_native("Chiz", opts, Box::new(|_cc| Ok(Box::new(gui_app)))) {
+        eprintln!("GUI failed to open ({e}); continuing headless");
+        futures_hang().await;
+    }
+}
+
+/// Park forever (headless server mode).
+async fn futures_hang() {
+    std::future::pending::<()>().await;
 }
