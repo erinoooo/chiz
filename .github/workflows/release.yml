@@ -15,6 +15,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: companion
       - name: rust tests
         working-directory: companion
         run: cargo test --workspace
@@ -28,24 +31,35 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: cache kotlinc
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/kotlin
+            /tmp/json.jar
+          key: kotlin-2.1.20-json-20240303
       - name: install kotlinc
         run: |
-          curl -sSL -o /tmp/kotlin.zip https://github.com/JetBrains/kotlin/releases/download/v2.1.20/kotlin-compiler-2.1.20.zip
-          unzip -q /tmp/kotlin.zip -d /tmp/kotlin
+          if [ ! -x /tmp/kotlin/kotlinc/bin/kotlinc ]; then
+            curl -sSL -o /tmp/kotlin.zip https://github.com/JetBrains/kotlin/releases/download/v2.1.20/kotlin-compiler-2.1.20.zip
+            unzip -q /tmp/kotlin.zip -d /tmp/kotlin
+          fi
+          [ -f /tmp/json.jar ] || curl -sSL -o /tmp/json.jar https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar
       - name: kotlin protocol tests
         run: |
           rm -rf /tmp/kt-out && mkdir -p /tmp/kt-out
-          curl -sSL -o /tmp/json.jar https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar
           CP="/tmp/kotlin/kotlinc/lib/kotlin-stdlib.jar:/tmp/json.jar"
           /tmp/kotlin/kotlinc/bin/kotlinc android/app/src/main/java/xyz/chiz/tablet/proto/*.kt android/jvmtest/TestMain.kt -cp "$CP" -d /tmp/kt-out
           java -cp "/tmp/kt-out:$CP" xyz.chiz.tablet.jvmtest.TestMainKt
 
   build-linux:
-    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: companion
       - name: release build
         working-directory: companion
         run: cargo build --release -p chiz-ui
@@ -60,11 +74,13 @@ jobs:
           path: dist/
 
   build-windows:
-    needs: test
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: companion
       - name: release build
         working-directory: companion
         run: cargo build --release -p chiz-ui
@@ -79,7 +95,6 @@ jobs:
           path: dist/
 
   build-android:
-    needs: test
     runs-on: ubuntu-latest
     env:
       ANDROID_HOME: /usr/local/lib/android/sdk

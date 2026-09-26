@@ -13,9 +13,11 @@ rcgen = "0.14"
 time = "0.3"
 mdns-sd = "0.21"
 qrcodegen = "1.8"
-image = "0.25"
+# JPEG only: default features drag in png/tiff/exr/webp/… for nothing.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 egui = "0.32"
-eframe = "0.32"
+# No accesskit/web extras: glow renderer + bundled fonts + both Linux backends.
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 getrandom = "0.2"
 
 [dev-dependencies]
