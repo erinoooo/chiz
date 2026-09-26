@@ -441,7 +441,7 @@ fun hexToBytes(h: String): ByteArray = ByteArray(h.length / 2) { h.substring(it 
 fun DrawingScreen(activity: MainActivity, onSettings: () -> Unit, onTest: () -> Unit, onDisconnect: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    val svc by activity.svcState
+    val svc = activity.svcState.value
     var profile by remember { mutableStateOf<StripProfile?>(null) }
     var toggles by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
     var status by remember { mutableStateOf(ConnState()) }
