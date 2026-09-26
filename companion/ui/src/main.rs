@@ -634,7 +634,7 @@ async fn handle_conn<S>(
                         break;
                     }
                 }
-                if (failed) {
+                if failed {
                     break;
                 }
                 continue;

@@ -187,6 +187,11 @@ pub struct WindowsPlatform {
     pub device: Option<windows::Win32::UI::Controls::HSYNTHETICPOINTERDEVICE>,
 }
 
+// Safety: the synthetic-pointer handle is a process-global kernel object
+// with no thread-local state; the injector only touches it from sequenced
+// async tasks, so moving the platform struct across threads is sound.
+unsafe impl Send for WindowsPlatform {}
+
 impl Default for WindowsPlatform {
     fn default() -> Self {
         Self {

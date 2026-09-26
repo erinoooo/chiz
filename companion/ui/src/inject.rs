@@ -8,6 +8,8 @@ use chiz_core::{apply_pressure_curve, map_pen_to_px};
 
 #[cfg(unix)]
 use chiz_platform_linux::Backend;
+#[cfg(windows)]
+use chiz_core::platform::Platform as _;
 
 #[derive(Clone, Debug)]
 pub struct ViewConfig {
