@@ -24,7 +24,18 @@ class PenAreaView @JvmOverloads constructor(
     var sender: PenSender? = null
     var onRange: ((Boolean) -> Unit)? = null
     private var stylusId = -1
-    private var sessionStart = SystemClock.uptimeMillis()
+    private var sessionStart = 0L
+    /** Test screen: report readout strings instead of sending. */
+    var testReadout: ((String) -> Unit)? = null
+    /** Test screen: draw a local ink trail (never sent anywhere). */
+    var drawInk: Boolean = false
+    private val ink = android.graphics.Path()
+    private val inkPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.parseColor("#E8C547")
+        style = android.graphics.Paint.Style.STROKE
+        strokeWidth = 4f
+        strokeCap = android.graphics.Paint.Cap.ROUND
+    }
 
     init {
         isFocusable = true
@@ -115,7 +126,35 @@ class PenAreaView @JvmOverloads constructor(
 
     private fun push(samples: List<PenRecord>, inRange: Boolean) {
         // UI thread: hand to the sender queue, never the network itself.
-        sender?.offer(samples, inRange)
+        val s = sender
+        if (s != null) {
+            s.offer(samples, inRange)
+        } else {
+            testReadout?.invoke(describe(samples.lastOrNull()))
+        }
+        if (drawInk) {
+            for (r in samples) {
+                val px = r.x / 65535f * width
+                val py = r.y / 65535f * height
+                if (r.phase == Phase.DOWN) ink.moveTo(px, py) else ink.lineTo(px, py)
+            }
+            if (samples.any { it.phase == Phase.UP || it.phase == Phase.LEAVE || it.phase == Phase.CANCEL }) {
+                ink.reset()
+            }
+            invalidate()
+        }
+    }
+
+    private fun describe(r: PenRecord?): String {
+        if (r == null) return "waiting for pen…"
+        return "x=${r.x} y=${r.y} pressure=${r.pressure} tilt=${r.tiltX}/${r.tiltY} " +
+            "distance=${r.distance} tool=${if (r.eraser) "eraser" else "pen"} " +
+            "buttons=${(if (r.barrel1) "B1" else "") + (if (r.barrel2) "B2" else "")} phase=${Phase.name(r.phase)}"
+    }
+
+    override fun onDraw(canvas: android.graphics.Canvas) {
+        super.onDraw(canvas)
+        if (drawInk) canvas.drawPath(ink, inkPaint)
     }
 
     private fun samplesFor(ev: MotionEvent, idx: Int, phase: Int): List<PenRecord> {

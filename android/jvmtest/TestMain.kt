@@ -1,5 +1,6 @@
 package xyz.chiz.tablet.jvmtest
 
+import org.json.JSONObject
 import xyz.chiz.tablet.proto.*
 
 var failures = mutableListOf<String>()
@@ -96,6 +97,24 @@ fun main() {
 
     // --- reconnect
     check("reconnect", (0..5).map { reconnectDelay(it) } == listOf(0.5, 1.0, 2.0, 4.0, 5.0, 5.0))
+
+    // --- profile parse + validate against the shipped companion files
+    for (file in listOf(
+        "companion/profiles/default.json",
+        "companion/profiles/krita.json",
+    )) {
+        val obj = JSONObject(java.io.File(file).readText())
+        val errs = validateStripProfile(obj)
+        check("profile-valid-$file", errs.isEmpty(), errs.toString())
+        val p = parseStripProfile(obj)
+        check("profile-parse-$file", p.cols in 1..3 && p.buttons.isNotEmpty())
+    }
+    val badOverlap = JSONObject(
+        """{"version":1,"id":"x","name":"X","grid":{"cols":1,"rows":1},"buttons":[
+        {"id":"a","label":"A","kind":"tap","col":0,"row":0,"action":{"type":"none"}},
+        {"id":"a","label":"B","kind":"tap","col":0,"row":0,"action":{"type":"none"}}]}""",
+    )
+    check("profile-dup-overlap", validateStripProfile(badOverlap).size >= 2)
 
     println()
     println("FAILURES: ${if (failures.isEmpty()) "none" else failures}")

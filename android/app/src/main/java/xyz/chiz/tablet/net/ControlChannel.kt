@@ -26,6 +26,7 @@ class ControlChannel(
     private val pinnedFp: ByteArray?,
     private val onMessage: (String) -> Unit,
     private val onDead: () -> Unit,
+    private val onPingSent: (Int) -> Unit = {},
 ) {
     @Volatile var observedFp: ByteArray? = null
     private var sock: SSLSocket? = null
@@ -65,6 +66,7 @@ class ControlChannel(
                     return@Thread
                 }
                 send("""{"t":"ping","id":${++pingId}}""")
+                onPingSent(pingId)
             }
         }, "chiz-pinger").apply { isDaemon = true; start() }
     }
