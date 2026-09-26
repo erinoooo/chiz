@@ -24,7 +24,7 @@ jobs:
       - run: pip install cryptography
       - name: protocol vectors
         run: python3 protocol/verify_m0.py && python3 protocol/verify_m1m2.py
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -84,7 +84,7 @@ jobs:
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -92,6 +92,8 @@ jobs:
         # GitHub runners preinstall the SDK; make sure our exact
         # platform + build-tools are present (idempotent).
         run: |
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          command -v sdkmanager
           yes | sdkmanager --licenses > /dev/null || true
           sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
       - uses: gradle/actions/setup-gradle@v4
