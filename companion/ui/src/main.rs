@@ -146,7 +146,7 @@ fn banner(msg: &str) {
 /// callback, watchdog): synchronously pauses pen input, releases every held
 /// key/button, and raises the banner. Never touches the network, disk, or
 /// the async runtime, so it works even if the session tasks are wedged.
-pub fn emergency_release(shared: &Arc<Shared>) {
+pub(crate) fn emergency_release(shared: &Arc<Shared>) {
     let newly = shared.failsafe.lock().expect("failsafe").emergency_release();
     // Release held keys even if pen was already paused: a stuck modifier
     // must never survive the panic switch.
@@ -232,11 +232,29 @@ fn foreground_app() -> Option<String> {
     None
 }
 
-/// Load `*.json` profiles from a directory, skipping invalid files.
-/// Tries several CWD-relative candidates so tests and the binary agree.
+/// Load `*.json` profiles. Search order: directory next to the executable
+/// (drop custom profiles beside the binary), then CWD-relative dev
+/// candidates. Falls back to the profiles embedded at compile time so a
+/// bare binary with no data files still works (the reported
+/// "profiles: 0 loaded" case).
 fn load_profiles() -> ProfileSet {
+    const EMBEDDED: &[&str] = &[
+        include_str!("../../profiles/default.json"),
+        include_str!("../../profiles/krita.json"),
+    ];
+    let mut dirs = vec![];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            dirs.push(dir.join("profiles").to_string_lossy().into_owned());
+        }
+    }
+    dirs.extend(
+        ["companion/profiles", "profiles", "./profiles", "../profiles"]
+            .iter()
+            .map(|s| s.to_string()),
+    );
     let mut profiles = vec![];
-    for dir in ["companion/profiles", "profiles", "./profiles", "../profiles"] {
+    for dir in &dirs {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
@@ -263,7 +281,19 @@ fn load_profiles() -> ProfileSet {
             profiles.push(prof);
         }
         if !profiles.is_empty() {
+            eprintln!("profiles loaded from {dir}");
             break;
+        }
+    }
+    if profiles.is_empty() {
+        for text in EMBEDDED {
+            match serde_json::from_str::<Profile>(text) {
+                Ok(prof) if profile::validate_profile(&prof).is_empty() => profiles.push(prof),
+                _ => eprintln!("built-in profile invalid (build bug)"),
+            }
+        }
+        if !profiles.is_empty() {
+            eprintln!("profiles: using built-in defaults (no profiles dir found)");
         }
     }
     profiles.sort_by(|a, b| a.id.cmp(&b.id));

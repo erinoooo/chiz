@@ -378,7 +378,7 @@ impl CompanionApp {
         ui.checkbox(&mut self.settings.start_at_login, "Start at login");
         ui.horizontal(|ui| {
             ui.label("Log level");
-            egui::ComboBox::from_id_source("log")
+            egui::ComboBox::from_id_salt("log")
                 .selected_text(&self.settings.log_level)
                 .show_ui(ui, |ui| {
                     for l in ["error", "warn", "info", "debug"] {
