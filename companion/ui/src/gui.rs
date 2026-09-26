@@ -144,7 +144,7 @@ impl GuiApp {
                 self.shared.pen_rx.blocking_lock().clear();
                 self.shared.pen_key.blocking_lock().clear();
                 let rel = self.shared.runner.blocking_lock().release_all();
-                super::apply_effects(&rel);
+                super::drive_all(self.shared.as_ref(), &rel);
                 super::release_all("forget tablet");
                 super::banner(&format!("Tablet forgotten ({id})."));
             }
@@ -153,7 +153,7 @@ impl GuiApp {
                 let next = self.shared.profiles.blocking_lock().switch(&target);
                 if let Some((id, reason)) = next {
                     let rel = self.shared.runner.blocking_lock().release_all();
-                    super::apply_effects(&rel);
+                    super::drive_all(self.shared.as_ref(), &rel);
                     self.rt
                         .block_on(broadcast_profile(&self.shared, &reason));
                     super::banner(&format!("Profile locked: {id}"));

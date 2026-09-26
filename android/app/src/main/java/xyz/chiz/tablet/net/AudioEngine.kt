@@ -32,6 +32,7 @@ class AudioEngine(private val context: Context) {
     private val earconNames = listOf("fire", "hold_on", "hold_off", "on", "off", "blocked", "connect", "disconnect")
     private var soundPool: SoundPool? = null
     private val earconIds = mutableMapOf<String, Int>()
+    private val cachedIds = mutableMapOf<String, Int>()
     private var tts: TextToSpeech? = null
     private val cacheDir: File = File(context.cacheDir, "speech").apply { mkdirs() }
 
@@ -55,6 +56,22 @@ class AudioEngine(private val context: Context) {
             if (status == TextToSpeech.SUCCESS) {
                 ttsReady = true
                 tts!!.setSpeechRate(speechRate)
+                // Cache completions land in the pool; live speech otherwise.
+                tts!!.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(id: String?) {}
+                    override fun onError(id: String?) {}
+                    override fun onDone(id: String?) {
+                        if (id?.startsWith("cache:") == true) {
+                            val f = File(cacheDir, id.removePrefix("cache:") + ".wav")
+                            if (f.exists()) {
+                                val sid = soundPool?.load(f.absolutePath, 1) ?: 0
+                                if (sid != 0) synchronized(cachedIds) { cachedIds[f.nameWithoutExtension] = sid }
+                            }
+                        }
+                    }
+                    @Deprecated("deprecated")
+                    override fun onError(id: String?, e: Int) {}
+                })
                 // Warm-up silent utterance (spec 7).
                 tts!!.speak("", TextToSpeech.QUEUE_FLUSH, null, "warmup")
                 onTtsReady()
@@ -75,13 +92,11 @@ class AudioEngine(private val context: Context) {
 
     fun speak(text: String) {
         if (feedbackMode == "earcons" || feedbackMode == "off") return
-        val cached = cacheFile(text)
-        if (cached.exists()) {
-            // Played through the pool path in the full implementation; the
-            // file mapping below keeps the latency-critical lookup pure.
-            playCached(cached)
-            return
-        }
+        if (playCached(text)) return
+        liveSpeak(text)
+    }
+
+    private fun liveSpeak(text: String) {
         val params = android.os.Bundle().apply {
             putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, volume)
         }
@@ -92,24 +107,35 @@ class AudioEngine(private val context: Context) {
     fun precache(texts: List<String>) {
         val t = tts ?: return
         if (!ttsReady) return
+        // Prime the pool with files already synthesized earlier.
         for (text in texts) {
             val f = cacheFile(text)
-            if (f.exists()) continue
-            t.synthesizeToFile(text, null, f, UUID.randomUUID().toString())
+            if (f.exists() && !cachedIds.containsKey(cacheKey(text))) {
+                val sid = soundPool?.load(f.absolutePath, 1) ?: 0
+                if (sid != 0) cachedIds[cacheKey(text)] = sid
+            }
+        }
+        for (text in texts) {
+            if (cacheFile(text).exists()) continue
+            t.synthesizeToFile(text, null, cacheFile(text), "cache:" + cacheKey(text))
         }
         trimCache(20 * 1024 * 1024)
     }
 
-    private fun cacheFile(text: String): File {
+    private fun cacheKey(text: String): String {
         val key = MessageDigest.getInstance("SHA-256")
             .digest("$text|${tts?.defaultEngine}|${Locale.getDefault()}|$speechRate".toByteArray())
             .joinToString("") { "%02x".format(it) }
-        return File(cacheDir, "$key.wav")
+        return key
     }
 
-    private fun playCached(f: File) {
-        // Loaded into SoundPool on first use; simplified here to direct play.
-        // Full path preloads all cached files at profile time (M5 detail).
+    private fun cacheFile(text: String): File = File(cacheDir, "${cacheKey(text)}.wav")
+
+    /** Cached pool playback; false = fall back to live TTS. */
+    private fun playCached(text: String): Boolean {
+        val sid = synchronized(cachedIds) { cachedIds[cacheKey(text)] } ?: return false
+        soundPool?.play(sid, volume, volume, 1, 0, 1.0f)
+        return true
     }
 
     private fun trimCache(maxBytes: Long) {

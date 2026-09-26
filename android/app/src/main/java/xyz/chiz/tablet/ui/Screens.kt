@@ -71,15 +71,19 @@ suspend fun Context.deviceId(): String {
 
 /** Screens (spec 6): Connect / Drawing / Settings / Test + 3-step intro. */
 class MainActivity : ComponentActivity() {
-    var svc: ConnectionService? = null
+    private var binder: ConnectionService.LocalBinder? = null
+    var svcState = mutableStateOf<ConnectionService?>(null)
         private set
 
     private val conn = object : ServiceConnection {
         override fun onServiceConnected(n: ComponentName?, b: IBinder?) {
-            svc = (b as ConnectionService.LocalBinder).service
+            val s = (b as ConnectionService.LocalBinder).service
+            binder = b as ConnectionService.LocalBinder
+            svcState.value = s
         }
         override fun onServiceDisconnected(n: ComponentName?) {
-            svc = null
+            binder = null
+            svcState.value = null
         }
     }
 
@@ -210,13 +214,13 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
         val pc = paired.firstOrNull { lastHost in it.hosts } ?: return@LaunchedEffect
         autoTried = true
         val id = ctx.deviceId()
-        activity.svc?.connect(
+        activity.svcState.value?.connect(
             lastHost, lastPort, id,
             PairInfo.Paired(pc.secretB64, hexToBytes(pc.fingerprintHex)),
         )
     }
-    LaunchedEffect(activity.svc) {
-        val s = activity.svc ?: return@LaunchedEffect
+    LaunchedEffect(activity.svcState.value) {
+        val s = activity.svcState.value ?: return@LaunchedEffect
         launch {
             // Reload the Keystore-backed list on every save (e.g. pair_ok).
             s.pairingsVersion.collect {
@@ -245,7 +249,7 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
                 val qr = parseQrUri(text)
                 val id = ctx.deviceId()
                 for (host in qr.hosts) {
-                    activity.svc?.connect(
+                    activity.svcState.value?.connect(
                         host, qr.port, id,
                         PairInfo.Qr(
                             android.util.Base64.encodeToString(qr.token, android.util.Base64.NO_WRAP),
@@ -294,7 +298,7 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
                             TextButton(onClick = {
                                 scope.launch {
                                     val id = ctx.deviceId()
-                                    activity.svc?.connect(
+                                    activity.svcState.value?.connect(
                                         addr?.first ?: pc.hosts.firstOrNull() ?: return@launch,
                                         47800, id,
                                         PairInfo.Paired(pc.secretB64, hexToBytes(pc.fingerprintHex)),
@@ -356,7 +360,7 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
                 sheet = null
                 scope.launch {
                     val id = ctx.deviceId()
-                    activity.svc?.connect(host, port, id, PairInfo.Pin(pin))
+                    activity.svcState.value?.connect(host, port, id, PairInfo.Pin(pin))
                 }
             },
             onDismiss = { sheet = null },
@@ -368,7 +372,7 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
                     val id = ctx.deviceId()
                     // Manual entry still needs a pairing mode; default to PIN
                     // entry against the typed address.
-                    activity.svc?.connect(host, port, id, PairInfo.Pin(""))
+                    activity.svcState.value?.connect(host, port, id, PairInfo.Pin(""))
                 }
             },
             onDismiss = { sheet = null },
@@ -437,7 +441,7 @@ fun hexToBytes(h: String): ByteArray = ByteArray(h.length / 2) { h.substring(it 
 fun DrawingScreen(activity: MainActivity, onSettings: () -> Unit, onTest: () -> Unit, onDisconnect: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    val svc = activity.svc
+    val svc by activity.svcState
     var profile by remember { mutableStateOf<StripProfile?>(null) }
     var toggles by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
     var status by remember { mutableStateOf(ConnState()) }
@@ -570,10 +574,14 @@ fun DrawingScreen(activity: MainActivity, onSettings: () -> Unit, onTest: () -> 
                             svc?.sendSurface(v.width, v.height)
                         }
                         penView = this
+                        svc?.registerPenView(this)
                     }
                 },
                 modifier = Modifier.fillMaxSize(),
             )
+        }
+        DisposableEffect(svc) {
+            onDispose { svc?.registerPenView(null) }
         }
 
         if (vertical) {

@@ -23,6 +23,12 @@ getrandom = "0.2"
 [dev-dependencies]
 # TLS1.2-only client for the no-fallback test (features unify with above).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[target.'cfg(unix)'.dependencies]
+chiz-platform-linux = { path = "../platform-linux" }
+
+[target.'cfg(windows)'.dependencies]
+chiz-platform-windows = { path = "../platform-windows" }
 # M6-M7 wiring (not yet compiled in): TLS identity, discovery, QR, tray, UI.
 # egui = "0.29"
 # tray-icon = "0.19"

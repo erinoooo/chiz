@@ -98,6 +98,16 @@ class ConnectionService : Service() {
     @Volatile private var hostAddr = ""
     @Volatile private var pcNameSeen = ""
     @Volatile private var portSeen = 47800
+    @Volatile private var surfaceW = 2100
+    @Volatile private var surfaceH = 1600
+    private var penView: xyz.chiz.tablet.ui.PenAreaView? = null
+
+    /** Drawing screen hands over its pen view; the session sender attaches
+     * on welcome (and detaches on teardown), so strokes always flow. */
+    fun registerPenView(v: xyz.chiz.tablet.ui.PenAreaView?) {
+        penView = v
+        v?.sender = sender
+    }
     private var pairInfo: PairInfo? = null
     private var wantStop = false
     private var panicUntil = 0L
@@ -160,7 +170,9 @@ class ConnectionService : Service() {
 
     private class StopLoop : Exception()
 
-    /** One session attempt: TLS + challenge; the message callbacks drive it. */
+    /** One session attempt: TLS + challenge; the message callbacks drive it.
+     * After `welcome` this parks until the transport dies or a clean stop,
+     * so mid-session drops reconnect instead of silently ending. */
     private fun runSession(host: String, port: Int) {
         val info = pairInfo ?: throw StopLoop()
         val pinned: ByteArray? = when (info) {
@@ -170,27 +182,34 @@ class ConnectionService : Service() {
         }
         if (info is PairInfo.Paired) secretB64 = info.secretB64
         phase = "wait_challenge"
+        armDeadline()
         val ch = ControlChannel(host, port, pinned, ::onControlMessage, ::onDead) {
             pingSent[it] = SystemClock.uptimeMillis()
         }
         ch.connect()
         control = ch
         holdLocks()
-        // Everything from here is callback-driven; this task just waits for
-        // terminal states. A watchdog closes sessions stuck pre-welcome.
-        val deadline = SystemClock.uptimeMillis() + 15000
-        while (!wantStop && phase != "connected" && phase != "dead") {
-            if (SystemClock.uptimeMillis() > deadline && phase != "connected") {
+        while (!wantStop && phase != "dead") {
+            if (phase != "connected" && SystemClock.uptimeMillis() > connectDeadline()) {
                 throw Exception("handshake timeout")
             }
             Thread.sleep(200)
         }
-        if (phase == "dead" || wantStop) throw StopLoop()
+        if (wantStop) throw StopLoop()
+        throw Exception("connection lost")
+    }
+
+    @Volatile private var deadlineAt = 0L
+    private fun connectDeadline(): Long = deadlineAt
+
+    private fun armDeadline() {
+        deadlineAt = SystemClock.uptimeMillis() + 15000
     }
 
     private fun onDead() {
         sender?.stop()
         sender = null
+        penView?.sender = null
         releaseLocks()
         phase = "dead" // runSession's waiter retries; live sessions reconnect
         if (!wantStop && _state.value.status == "connected") {
@@ -265,7 +284,7 @@ class ConnectionService : Service() {
                             put("eraser", true); put("barrel", 2); put("video", false)
                         })
                         // pen_area ratio is refreshed by later `surface` msgs.
-                        put("pen_area", JSONObject().apply { put("w", 2100); put("h", 1600) })
+                        put("pen_area", JSONObject().apply { put("w", surfaceW); put("h", surfaceH) })
                     }.toString(),
                 )
                 phase = "wait_welcome"
@@ -348,6 +367,8 @@ class ConnectionService : Service() {
                 control?.close()
             },
         )
+        penView?.sender = sender
+        penView?.newSession()
         phase = "connected"
         _state.value = ConnState("connected", o.optString("pc_name", hostAddr), "")
         // Remember for auto-connect (auto device discovery).
@@ -393,6 +414,10 @@ class ConnectionService : Service() {
     }
 
     fun sendSurface(w: Int, h: Int) {
+        if (w > 0 && h > 0) {
+            surfaceW = w
+            surfaceH = h
+        }
         control?.send(JSONObject().apply {
             put("t", "surface")
             put("w", w)
@@ -424,6 +449,7 @@ class ConnectionService : Service() {
         control = null
         sender?.stop()
         sender = null
+        penView?.sender = null
         muteJob?.cancel()
         // Release local holds: fresh TouchMachines on next session.
         _toggleStates.value = emptyMap()

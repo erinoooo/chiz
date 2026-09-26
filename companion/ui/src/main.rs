@@ -15,6 +15,7 @@
 
 mod control;
 mod gui;
+mod inject;
 mod identity;
 mod mdns;
 mod pairing;
@@ -23,7 +24,7 @@ mod screens;
 mod tray;
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -42,6 +43,12 @@ struct Config {
     pen_port: u16,
     allow_public: bool, // default false (spec 12.7)
     panic_hotkey: String,
+    desktop_w: i32,
+    desktop_h: i32,
+    area: (f64, f64, f64, f64),
+    keep_aspect: bool,
+    rotation: u16,
+    pressure_curve: [f64; 4],
 }
 
 impl Default for Config {
@@ -51,6 +58,12 @@ impl Default for Config {
             pen_port: 47801,
             allow_public: false,
             panic_hotkey: DEFAULT_PANIC_HOTKEY.into(),
+            desktop_w: 1920,
+            desktop_h: 1080,
+            area: (0.0, 0.0, 1.0, 1.0),
+            keep_aspect: true,
+            rotation: 0,
+            pressure_curve: [0.25, 0.25, 0.75, 0.75],
         }
     }
 }
@@ -78,6 +91,46 @@ impl Config {
         }
         if let Some(h) = v.get("panic_hotkey").and_then(|h| h.as_str()) {
             cfg.panic_hotkey = h.to_string();
+        }
+        if let Some(d) = v.get("desktop") {
+            if let Some(w) = d.get("w").and_then(|w| w.as_i64()) {
+                cfg.desktop_w = w as i32;
+            }
+            if let Some(h) = d.get("h").and_then(|h| h.as_i64()) {
+                cfg.desktop_h = h as i32;
+            }
+        }
+        if let Some(m) = v.get("mapping") {
+            if let Some(a) = m.get("area") {
+                let g = |k: &str| a.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let (mut x, mut y, mut w, mut h) = (g("x"), g("y"), g("w"), g("h"));
+                if w <= 0.0 || w > 1.0 {
+                    w = 1.0;
+                }
+                if h <= 0.0 || h > 1.0 {
+                    h = 1.0;
+                }
+                x = x.clamp(0.0, 1.0 - w.min(1.0));
+                y = y.clamp(0.0, 1.0 - h.min(1.0));
+                cfg.area = (x, y, w, h);
+            }
+            if let Some(k) = m.get("keep_aspect").and_then(|k| k.as_bool()) {
+                cfg.keep_aspect = k;
+            }
+            if let Some(r) = m.get("rotation").and_then(|r| r.as_u64()) {
+                if matches!(r, 0 | 90 | 180 | 270) {
+                    cfg.rotation = r as u16;
+                }
+            }
+        }
+        if let Some(c) = v.get("pressure_curve").and_then(|c| c.as_array()) {
+            if c.len() == 4 {
+                let mut curve = [0.25, 0.25, 0.75, 0.75];
+                for (i, x) in c.iter().enumerate() {
+                    curve[i] = x.as_f64().unwrap_or(curve[i]);
+                }
+                cfg.pressure_curve = curve;
+            }
         }
         cfg
     }
@@ -119,6 +172,8 @@ struct Shared {
     fp: [u8; 32], // own cert fingerprint: binds PIN proofs, feeds QR/mDNS
     pen_key: Mutex<HashMap<u32, ([u8; 32], String)>>, // session_id -> (key, peer ip)
     pen_rx: Mutex<HashMap<u32, PenReceiver>>,         // session_id -> receiver
+    pen_aspect: Mutex<HashMap<u32, (u32, u32)>>,       // session_id -> pen area px
+    injector: std::sync::Mutex<inject::Injector>,
     mail: Mutex<HashMap<u64, VecDeque<Vec<u8>>>>,     // conn_id -> queued server frames
     profiles: Mutex<ProfileSet>,
     runner: Mutex<ActionRunner>,
@@ -134,22 +189,39 @@ fn banner(msg: &str) {
     eprintln!("CHIZ: {msg}");
 }
 
-/// THE emergency off switch. Callable from ANY thread (OS hotkey hook, tray
-/// callback, watchdog): synchronously pauses pen input, releases every held
-/// key/button, and raises the banner. Never touches the network, disk, or
-/// the async runtime, so it works even if the session tasks are wedged.
+/// Handle to the async runtime for fire-and-forget work requested from sync
+/// contexts (GUI thread, OS hotkey hook). Set once at startup.
+static RT: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
+/// THE emergency off switch. Callable from ANY thread (OS hotkey hook, GUI
+/// button, watchdog): flips the failsafe latch synchronously, then hands
+/// the release work to the runtime without blocking the caller. Never
+/// touches the network or disk inline, so it works even if session tasks
+/// are wedged — and never deadlocks the GUI thread (no block_on anywhere).
 pub(crate) fn emergency_release(shared: &Arc<Shared>) {
     let newly = shared.failsafe.lock().expect("failsafe").emergency_release();
     // Release held keys even if pen was already paused: a stuck modifier
     // must never survive the panic switch.
-    let rel = shared.runner.blocking_lock().release_all();
-    apply_effects(&rel);
-    eprintln!("inject_pen up+leave (panic)");
-    release_all("panic");
-    if newly {
-        banner("Emergency release: pen paused, everything released. Resume from the tray.");
-    } else {
-        banner("Emergency release: everything released (pen already paused).");
+    let sh = Arc::clone(shared);
+    let release = move || {
+        let rel = sh.runner.blocking_lock().release_all();
+        drive_all(&sh, &rel);
+        sh.injector.lock().expect("injector").force_leave();
+        release_all("panic");
+        if newly {
+            banner("Emergency release: pen paused, everything released. Resume from the tray.");
+        } else {
+            banner("Emergency release: everything released (pen already paused).");
+        }
+    };
+    match RT.get() {
+        Some(rt) => {
+            rt.spawn(async move {
+                // Run the blocking release off the async workers.
+                tokio::task::block_in_place(release);
+            });
+        }
+        None => release(), // tests / pre-runtime: run inline
     }
 }
 
@@ -161,7 +233,8 @@ fn tray_action(shared: &Arc<Shared>, item: &str) {
         "pause" => {
             if shared.failsafe.lock().expect("failsafe").pause(PauseReason::Manual) {
                 let rel = shared.runner.blocking_lock().release_all();
-                apply_effects(&rel);
+                drive_all(shared.as_ref(), &rel);
+                shared.injector.lock().expect("injector").force_leave();
                 release_all("pause");
                 banner("Pen input paused. Buttons keep working.");
             }
@@ -338,21 +411,27 @@ fn action_wire(a: &profile::Action) -> serde_json::Value {
     }
 }
 
-/// Apply non-toggle effects to the platform. Key/mouse go to
-/// `SendInput`/uinput via the platform crates (M3); until then they are
-/// logged so button dispatch is demonstrable end to end.
-fn apply_effects(effects: &[Effect]) {
-    for fx in effects {
-        match fx {
-            Effect::Key { key, down } => {
-                eprintln!("inject_key {key} {}", if *down { "down" } else { "up" });
+/// Apply Key/Mouse effects to the real OS injector (SendInput/uinput).
+/// Sync: the injector lock is never held across await.
+fn drive(shared: &Shared, fx: &Effect) {
+    let mut inj = shared.injector.lock().expect("injector");
+    inj.ensure(now_secs());
+    match fx {
+        Effect::Key { key, down } => {
+            if *down {
+                inj.key(key, true);
+            } else {
+                inj.key_release(key);
             }
-            Effect::Mouse { button, down } => {
-                eprintln!("inject_mouse {button} {}", if *down { "down" } else { "up" });
-            }
-            Effect::WaitMs(_) => {}
-            _ => {}
         }
+        Effect::Mouse { button, down } => inj.mouse(button, *down),
+        _ => {}
+    }
+}
+
+fn drive_all(shared: &Shared, effects: &[Effect]) {
+    for fx in effects {
+        drive(shared, fx);
     }
 }
 
@@ -384,15 +463,21 @@ async fn handle_pen_datagram(shared: &Arc<Shared>, dg: &[u8], src: SocketAddr) {
         return;
     };
     let (recs, _stats) = pen::handle_datagram(rx, dg, &src.ip().to_string(), &key, now_secs());
+    if recs.is_empty() {
+        return;
+    }
     let eraser_forced = shared.runner.lock().await.eraser_on;
+    let aspect = shared.pen_aspect.lock().await.get(&sid).copied().unwrap_or((2100, 1600));
+    // Pause gate re-check is above; inject through the OS device now.
+    let mut inj = shared.injector.lock().expect("injector");
+    inj.ensure(now_secs());
     for r in recs {
         // Pipeline order (spec 8): rotate+map -> pressure curve ->
-        // eraser-toggle -> inject_pen. Monitor mapping lands with the
-        // platform layers (M2/M3); coordinates logged until then.
+        // eraser-toggle -> inject_pen.
         let eraser = r.eraser || eraser_forced;
-        eprintln!(
-            "inject_pen phase={} x={} y={} p={} tilt={}/{} eraser={}",
-            r.phase, r.x, r.y, r.pressure, r.tilt_x, r.tilt_y, eraser
+        inj.pen(
+            r.phase, r.x, r.y, r.pressure, r.distance, r.tilt_x, r.tilt_y, eraser, r.barrel1,
+            r.barrel2, aspect,
         );
         shared.failsafe.lock().expect("failsafe").note_clean_input();
     }
@@ -411,10 +496,19 @@ async fn watchdog_tick(shared: &Arc<Shared>) {
             }
         }
     }
+    // Inject every watchdog repair (up+leave / leave) through the device.
+    {
+        let mut inj = shared.injector.lock().expect("injector");
+        inj.ensure(now_secs());
+        for _ in 0..trips {
+            inj.force_leave();
+        }
+    }
     for _ in 0..trips {
         if shared.failsafe.lock().expect("failsafe").note_stuck_trip().is_some() {
             let rel = shared.runner.lock().await.release_all();
-            apply_effects(&rel);
+            drive_all(shared.as_ref(), &rel);
+            shared.injector.lock().expect("injector").force_leave();
             release_all("auto-pause");
             banner("Pen auto-paused after repeated stuck input. Resume from the tray.");
         }
@@ -423,9 +517,9 @@ async fn watchdog_tick(shared: &Arc<Shared>) {
 
 /// Platform hook: MUST lift pen, leave range, release every key/button
 /// when a session ends, the profile changes, or the app quits (spec 4, 8).
+/// Sync so the panic thread can call it; takes the injector briefly.
 fn release_all(reason: &str) {
-    // Wired to platform-windows / platform-linux injectors in M3.
-    eprintln!("release_all({reason}) [stub: no OS injector wired yet]");
+    eprintln!("release_all({reason})");
 }
 
 async fn send_msg(stream: &mut (impl AsyncWriteExt + Unpin), v: &serde_json::Value) -> std::io::Result<()> {
@@ -489,10 +583,12 @@ async fn handle_conn<S>(
         }
         *n += 1;
     }
-    let dec_unauth = || async {
-        let mut n = shared.unauth_count.lock().await;
-        *n = n.saturating_sub(1);
-    };
+
+    let accept_at = Instant::now();
+    let mut stage = ConnStage::Unauth { since: 0.0 };
+    let mut buf: Vec<u8> = Vec::new();
+    let mut last_rx = Instant::now();
+    let conn_id: u64 = peer.port() as u64 | ((now_secs() * 1000.0) as u64) << 32;
 
     // Challenge first (fresh 16-byte nonce per connection).
     let mut nonce = [0u8; 16];
@@ -504,15 +600,9 @@ async fn handle_conn<S>(
     });
     let pairing_now_open = shared.pairing.lock().await.is_open(now_secs());
     if send_msg(&mut stream, &challenge_for(&nonce, pairing_now_open)).await.is_err() {
-        dec_unauth().await;
+        release_unauth(&shared).await;
         return;
     }
-
-    let accept_at = Instant::now();
-    let mut stage = ConnStage::Unauth { since: 0.0 };
-    let mut buf: Vec<u8> = Vec::new();
-    let mut last_rx = Instant::now();
-    let conn_id: u64 = peer.port() as u64 | ((now_secs() * 1000.0) as u64) << 32;
 
     loop {
         if matches!(stage, ConnStage::Unauth { .. })
@@ -651,6 +741,15 @@ async fn handle_conn<S>(
                 shared.auth.lock().await.record_success(&peer_ip);
                 match shared.sessions.lock().await.auth(conn_id, &device_id) {
                     Ok(sid) => {
+                        // Pen-area ratio drives mapping (spec 8); refreshed
+                        // by later `surface` messages.
+                        if let Some(pa) = msg.get("pen_area") {
+                            let w = pa.get("w").and_then(|v| v.as_u64()).unwrap_or(2100).max(1) as u32;
+                            let h = pa.get("h").and_then(|v| v.as_u64()).unwrap_or(1600).max(1) as u32;
+                            shared.pen_aspect.lock().await.insert(sid, (w, h));
+                        } else {
+                            shared.pen_aspect.lock().await.insert(sid, (2100, 1600));
+                        }
                         let mut salt = [0u8; 16];
                         os_random(&mut salt);
                         let key = derive_pen_key(&secret, &salt);
@@ -678,7 +777,7 @@ async fn handle_conn<S>(
                             }
                         }
                         stage = ConnStage::Authed { session_id: sid };
-                        dec_unauth().await;
+                        release_unauth(shared.as_ref()).await;
                     }
                     Err(_holder) => {
                         let _ = send_msg(&mut stream, &error_msg("busy", "another tablet is connected")).await;
@@ -712,18 +811,19 @@ async fn handle_conn<S>(
                 // blocking this control loop); everything else applies now.
                 if effects.iter().any(|e| matches!(e, Effect::WaitMs(_))) {
                     let fx_owned = effects.clone();
+                    let sh_clone = Arc::clone(&shared);
                     tokio::spawn(async move {
                         for fx in &fx_owned {
                             match fx {
                                 Effect::WaitMs(ms) => {
                                     tokio::time::sleep(Duration::from_millis(*ms as u64)).await;
                                 }
-                                f => apply_effects(std::slice::from_ref(f)),
+                                f => drive_all(sh_clone.as_ref(), std::slice::from_ref(f)),
                             }
                         }
                     });
                 } else {
-                    apply_effects(&effects);
+                    drive_all(shared.as_ref(), &effects);
                 }
                 for fx in &effects {
                     match fx {
@@ -742,7 +842,7 @@ async fn handle_conn<S>(
                         Effect::SwitchProfile { target } => {
                             // A hold still held is released first.
                             let rel = shared.runner.lock().await.release_all();
-                            apply_effects(&rel);
+                            drive_all(shared.as_ref(), &rel);
                             let next = shared.profiles.lock().await.switch(target);
                             if let Some((id, reason)) = next {
                                 let ps = shared.profiles.lock().await;
@@ -759,12 +859,11 @@ async fn handle_conn<S>(
             "surface" => {
                 // Pen area size changed (rotation, strip resize). The
                 // companion uses only its ratio for mapping.
-                if matches!(stage, ConnStage::Authed { .. }) {
-                    eprintln!(
-                        "surface {}x{}",
-                        msg.get("w").and_then(|v| v.as_i64()).unwrap_or(0),
-                        msg.get("h").and_then(|v| v.as_i64()).unwrap_or(0)
-                    );
+                if let Some(sid) = shared.sessions.lock().await.session_of(conn_id) {
+                    let w = msg.get("w").and_then(|v| v.as_u64()).unwrap_or(0).max(1) as u32;
+                    let h = msg.get("h").and_then(|v| v.as_u64()).unwrap_or(0).max(1) as u32;
+                    shared.pen_aspect.lock().await.insert(sid, (w, h));
+                    eprintln!("surface {w}x{h}");
                 }
             }
             _ => {} // unknown / not-yet-wired types ignored per spec
@@ -772,12 +871,18 @@ async fn handle_conn<S>(
     }
 
     // Session teardown: release everything, drop pen keys (spec 4).
+    // Connections that never authenticated still hold an unauth slot.
+    if matches!(stage, ConnStage::Unauth { .. }) {
+        release_unauth(shared.as_ref()).await;
+    }
     shared.mail.lock().await.remove(&conn_id);
     if let Some(sid) = shared.sessions.lock().await.session_of(conn_id) {
         shared.pen_key.lock().await.remove(&sid);
         shared.pen_rx.lock().await.remove(&sid);
+        shared.pen_aspect.lock().await.remove(&sid);
         let rel = shared.runner.lock().await.release_all();
-        apply_effects(&rel);
+        drive_all(shared.as_ref(), &rel);
+        shared.injector.lock().expect("injector").force_leave();
         release_all("session end");
     }
     shared.sessions.lock().await.remove_conn(conn_id);
@@ -901,9 +1006,11 @@ async fn open_pairing(shared: &Arc<Shared>, fp: &[u8; 32]) {
     let _ = token;
 }
 
-#[allow(dead_code)]
-fn peer_ip_of(_a: &SocketAddr) -> IpAddr {
-    _a.ip()
+/// Release one unauthenticated-connection slot. Every exit path that never
+/// authenticated must call this (or the 4-slot cap wedges permanently).
+async fn release_unauth(shared: &Shared) {
+    let mut n = shared.unauth_count.lock().await;
+    *n = n.saturating_sub(1);
 }
 
 #[cfg(test)]
@@ -955,6 +1062,8 @@ mod tests {
             fp: [0xabu8; 32],
             pen_key: Mutex::new(pen_key),
             pen_rx: Mutex::new(pen_rx),
+            pen_aspect: Mutex::new(HashMap::new()),
+            injector: std::sync::Mutex::new(inject::Injector::new(inject::ViewConfig::default())),
             mail: Mutex::new(HashMap::new()),
             profiles: Mutex::new(ProfileSet { profiles: vec![], locked: None }),
             runner: Mutex::new(ActionRunner::default()),
@@ -1007,8 +1116,7 @@ mod tests {
     }
 }
 
-#[tokio::main]
-async fn main() {
+async fn setup() -> Boot {
     let cfg = Config::load("companion/config.example.json");
     let profiles = load_profiles();
     eprintln!(
@@ -1033,6 +1141,15 @@ async fn main() {
         fp: id.fingerprint,
         pen_key: Mutex::new(HashMap::new()),
         pen_rx: Mutex::new(HashMap::new()),
+        pen_aspect: Mutex::new(HashMap::new()),
+        injector: std::sync::Mutex::new(inject::Injector::new(inject::ViewConfig {
+            union_w: cfg.desktop_w,
+            union_h: cfg.desktop_h,
+            area: cfg.area,
+            keep_aspect: cfg.keep_aspect,
+            rotation: cfg.rotation,
+            curve: cfg.pressure_curve,
+        })),
         mail: Mutex::new(HashMap::new()),
         profiles: Mutex::new(profiles),
         runner: Mutex::new(ActionRunner::default()),
@@ -1080,81 +1197,122 @@ async fn main() {
         shared.failsafe.lock().expect("failsafe").panic_hotkey.join("+")
     );
 
-    // Pen receive task (spec 2: never touches disk, DNS, UI, or control).
-    {
-        let sh = Arc::clone(&shared);
-        let sock = Arc::clone(&udp);
-        tokio::spawn(async move {
-            let mut buf = [0u8; 4096];
-            loop {
-                let Ok((n, src)) = sock.recv_from(&mut buf).await else {
-                    continue;
-                };
-                // Copy out: handle_pen_datagram awaits on locks.
-                let dg = buf[..n].to_vec();
-                handle_pen_datagram(&sh, &dg, src).await;
-            }
-        });
-    }
-    // Watchdog ticker: 100 ms stuck-pen checks + stuck-trip auto-pause.
-    {
-        let sh = Arc::clone(&shared);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(100));
-            loop {
-                tick.tick().await;
-                watchdog_tick(&sh).await;
-            }
-        });
-    }
-    // NOTE: the OS global-hotkey thread (RegisterHotKey / XGrabKey, see
-    // platform crates) calls `emergency_release(&shared)` from outside the
-    // runtime. Tray "Emergency release" calls it too via `tray_action`.
-
-    // mDNS: convenience only, never required (manual IP entry always works).
-    let _mdns = mdns::start(&me, cfg.control_port, &id.fingerprint);
-
     let listener = TcpListener::bind(("0.0.0.0", cfg.control_port))
         .await
         .expect("bind control TCP");
     // TLS 1.3 identity (spec 3): every control byte travels inside this
     // acceptor. No plaintext fallback (spec 12.5).
     let acceptor = tokio_rustls::TlsAcceptor::from(identity::server_config(&id).expect("tls config"));
-    let accept_shared = Arc::clone(&shared);
-    let accept_cfg = cfg.clone();
-    tokio::spawn(async move {
-        loop {
-            let Ok((tcp, peer)) = listener.accept().await else {
-                continue;
-            };
-            let Ok(tls) = acceptor.accept(tcp).await else {
-                continue; // handshake failure (wrong version, junk): just close
-            };
-            let (cfg_c, sh_c) = (accept_cfg.clone(), Arc::clone(&accept_shared));
-            tokio::spawn(async move { handle_conn(tls, peer, cfg_c, sh_c).await });
-        }
-    });
+    Boot {
+        cfg,
+        shared,
+        fp: id.fingerprint,
+        hostname: me,
+        udp,
+        listener,
+        acceptor,
+    }
+}
+
+/// Everything the server tasks and the GUI need. Built once at startup;
+/// the GUI thread never blocks on the runtime (all requests go through
+/// spawn/mailbox), so action buttons cannot wedge or crash the app.
+struct Boot {
+    cfg: Config,
+    shared: Arc<Shared>,
+    fp: [u8; 32],
+    hostname: String,
+    udp: Arc<UdpSocket>,
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+fn main() {
+    // Manual runtime (not #[tokio::main]): the GUI event loop runs on the
+    // main thread OUTSIDE any runtime-enter context, so sync entry points
+    // (panic hook, tray, GUI buttons) can always hand work to the runtime
+    // without nested block_on deadlocks.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let _ = RT.set(rt.handle().clone());
+    let boot = rt.block_on(setup());
+
+    // mDNS: convenience only, never required (manual IP entry always works).
+    let _mdns = mdns::start(&boot.hostname, boot.cfg.control_port, &boot.fp);
+
+    // Server tasks (spec 2 threading: pen never waits on control/UI).
+    rt.spawn(pen_task(Arc::clone(&boot.shared), Arc::clone(&boot.udp)));
+    rt.spawn(tick_task(Arc::clone(&boot.shared)));
+    rt.spawn(accept_task(
+        Arc::clone(&boot.shared),
+        boot.listener,
+        boot.acceptor,
+        boot.cfg.clone(),
+    ));
 
     if gui::headless() {
-        eprintln!("headless mode: no window (use --headless to force, unset CHIZ_HEADLESS for GUI)");
-        futures_hang().await;
+        eprintln!("headless mode: no window (unset CHIZ_HEADLESS / omit --headless for GUI)");
+        rt.block_on(std::future::pending::<()>());
         return;
     }
     // GUI is the default: the main window opens on launch with status,
     // pairing (QR + PIN), profiles, mapping, pressure and settings.
-    let rt = tokio::runtime::Handle::current();
-    let gui_app = gui::GuiApp::new(rt, shared, id.fingerprint, me.clone(), cfg.control_port);
+    let gui_app = gui::GuiApp::new(
+        rt.handle().clone(),
+        boot.shared,
+        boot.fp,
+        boot.hostname,
+        boot.cfg.control_port,
+    );
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1024.0, 720.0]),
         ..Default::default()
     };
+    // NOTE: the OS global-hotkey thread (RegisterHotKey / XGrabKey, see
+    // platform crates) calls `emergency_release(&shared)` from outside the
+    // runtime. Tray "Emergency release" calls it too via `tray_action`.
     if let Err(e) = eframe::run_native("Chiz", opts, Box::new(|_cc| Ok(Box::new(gui_app)))) {
         eprintln!("GUI failed to open ({e}); continuing headless");
-        futures_hang().await;
+        rt.block_on(std::future::pending::<()>());
     }
 }
 
-/// Park forever (headless server mode).
-async fn futures_hang() {
-    std::future::pending::<()>().await;
+async fn pen_task(shared: Arc<Shared>, sock: Arc<UdpSocket>) {
+    let mut buf = [0u8; 4096];
+    loop {
+        let Ok((n, src)) = sock.recv_from(&mut buf).await else {
+            continue;
+        };
+        // Copy out: handle_pen_datagram awaits on locks.
+        let dg = buf[..n].to_vec();
+        handle_pen_datagram(&shared, &dg, src).await;
+    }
+}
+
+async fn tick_task(shared: Arc<Shared>) {
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        tick.tick().await;
+        watchdog_tick(&shared).await;
+    }
+}
+
+async fn accept_task(
+    shared: Arc<Shared>,
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    cfg: Config,
+) {
+    loop {
+        let Ok((tcp, peer)) = listener.accept().await else {
+            continue;
+        };
+        let Ok(tls) = acceptor.accept(tcp).await else {
+            continue; // handshake failure (wrong version, junk): just close
+        };
+        let (cfg_c, sh_c) = (cfg.clone(), Arc::clone(&shared));
+        tokio::spawn(async move { handle_conn(tls, peer, cfg_c, sh_c).await });
+    }
 }

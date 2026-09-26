@@ -428,6 +428,8 @@ name = "chiz-ui"
 version = "1.0.0"
 dependencies = [
  "chiz-core",
+ "chiz-platform-linux",
+ "chiz-platform-windows",
  "eframe",
  "egui",
  "getrandom 0.2.17",
