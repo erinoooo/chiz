@@ -135,12 +135,13 @@ pub struct ProfilesView {
     pub editor_error: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct TabletsView {
     pub paired: Vec<(String, String)>, // (device_id, name)
     pub pairing_open: bool,
     pub countdown_s: u64,
     pub pin: String,
+    pub qr_tex: Option<egui::TextureHandle>,
 }
 
 #[derive(Clone, Debug)]
@@ -393,6 +394,10 @@ impl CompanionApp {
                 "Pairing open: {} s left — PIN {}",
                 self.tablets.countdown_s, self.tablets.pin
             ));
+            ui.label("Scan the QR below, or type the PIN on the tablet (trusted networks only).");
+            if let Some(tex) = &self.tablets.qr_tex {
+                ui.image(tex);
+            }
         } else if ui.button("Pair new tablet").clicked() {
             self.act(PendingAction::PairOpen);
         }

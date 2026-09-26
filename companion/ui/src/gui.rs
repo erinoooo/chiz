@@ -20,6 +20,8 @@ pub struct GuiApp {
     hostname: String,
     port: u16,
     app: CompanionApp,
+    qr_tex: Option<egui::TextureHandle>,
+    qr_mtime: Option<std::time::SystemTime>,
 }
 
 impl GuiApp {
@@ -37,7 +39,39 @@ impl GuiApp {
             hostname,
             port,
             app: CompanionApp::default(),
+            qr_tex: None,
+            qr_mtime: None,
         }
+    }
+
+    /// Load the freshly rendered pairing QR into a retained texture.
+    /// Reloads only when the file changes; dropped when the window closes.
+    fn sync_qr(&mut self, ctx: &egui::Context) {
+        if !self.app.tablets.pairing_open {
+            self.qr_tex = None;
+            self.qr_mtime = None;
+            self.app.tablets.qr_tex = None;
+            return;
+        }
+        let path = super::identity::data_dir().join("pair_qr.jpg");
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if mtime == self.qr_mtime && self.qr_tex.is_some() {
+            self.app.tablets.qr_tex = self.qr_tex.clone();
+            return;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        let Ok(img) = image::load_from_memory(&bytes) else {
+            return;
+        };
+        let luma = img.to_luma8();
+        let (w, h) = (luma.width() as usize, luma.height() as usize);
+        let color = egui::ColorImage::from_gray([w, h], luma.as_raw());
+        let tex = ctx.load_texture("pair-qr", color, egui::TextureOptions::LINEAR);
+        self.qr_tex = Some(tex.clone());
+        self.qr_mtime = mtime;
+        self.app.tablets.qr_tex = Some(tex);
     }
 
     fn sync(&mut self) {
@@ -167,6 +201,7 @@ impl GuiApp {
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.sync();
+        self.sync_qr(ctx);
         self.app.show(ctx);
         for a in std::mem::take(&mut self.app.pending) {
             self.exec(a);

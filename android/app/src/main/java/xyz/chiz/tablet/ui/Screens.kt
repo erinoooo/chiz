@@ -207,6 +207,7 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
         val prefs = ctx.settingsStore.data.first()
         if (prefs[SettingsKeys.AUTO_CONNECT] == false) return@LaunchedEffect
         val lastHost = prefs[SettingsKeys.LAST_HOST] ?: return@LaunchedEffect
+        if (lastHost == state.mismatchHost) return@LaunchedEffect // stale cert: user must forget + re-pair
         val lastPort = prefs[SettingsKeys.LAST_PORT] ?: SettingsDefaults.LAST_PORT
         val seen = found.values.any { (h, p) -> h == lastHost && p == lastPort }
         val known = paired.any { pc -> lastHost in pc.hosts }
@@ -280,7 +281,26 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
             }
             if (state.message.isNotEmpty()) {
                 item {
-                    Card(Modifier.fillMaxWidth().padding(vertical = 8.dp)) { Text(state.message, Modifier.padding(12.dp)) }
+                    Card(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                        Column(Modifier.padding(12.dp), Arrangement.spacedBy(8.dp)) {
+                            Text(state.message)
+                            // One-tap remediation for a rotated PC cert.
+                            val bad = paired.firstOrNull {
+                                state.mismatchHost.isNotEmpty() && state.mismatchHost in it.hosts
+                            }
+                            if (state.status == "error" && bad != null) {
+                                Button(onClick = {
+                                    scope.launch {
+                                        try {
+                                            store.save(paired.filter { it.pcId != bad.pcId })
+                                        } catch (e: Exception) {
+                                        }
+                                        paired = paired.filter { it.pcId != bad.pcId }
+                                    }
+                                }) { Text("Forget ${bad.name} and re-pair") }
+                            }
+                        }
+                    }
                 }
             }
             items(paired, key = { it.pcId }) { pc ->

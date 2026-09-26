@@ -1131,6 +1131,7 @@ async fn setup() -> Boot {
     );
     let me = hostname();
     let id = identity::load_or_generate(&me).expect("TLS identity");
+    eprintln!("identity dir: {}", identity::data_dir().display());
     eprintln!("cert fingerprint sha256: {}", identity::fp_hex(&id.fingerprint));
     let shared = Arc::new(Shared {
         sessions: Mutex::new(SessionTable::default()),

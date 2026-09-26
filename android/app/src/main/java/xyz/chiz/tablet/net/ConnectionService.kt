@@ -47,6 +47,8 @@ data class ConnState(
     val message: String = "",
     val pairingOpen: Boolean = false,
     val attemptsLeft: Int = 5,
+    /** Host whose cert just mismatched: auto-connect must skip it. */
+    val mismatchHost: String = "",
 )
 
 /** How this tablet will prove itself. Set by the UI before connect(). */
@@ -171,7 +173,7 @@ class ConnectionService : Service() {
                 } catch (e: StopLoop) {
                     return@launch // clean disconnect / fatal error: no retry
                 } catch (e: CertMismatch) {
-                    _state.value = ConnState("error", "", e.message ?: "certificate mismatch")
+                    _state.value = ConnState("error", "", e.message ?: "certificate mismatch", mismatchHost = hostAddr)
                     wantStop = true
                     return@launch // permanent: never hammer a wrong cert
                 } catch (e: Exception) {
