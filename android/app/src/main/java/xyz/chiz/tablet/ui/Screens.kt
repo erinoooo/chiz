@@ -225,7 +225,9 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
             // Reload the Keystore-backed list on every save (e.g. pair_ok).
             s.pairingsVersion.collect {
                 paired = try {
-                    store.load()
+                    // Drop corrupt/blank records: they can never authenticate
+                    // and would only produce fingerprint mismatches.
+                    store.load().filter { it.secretB64.isNotBlank() && it.fingerprintHex.isNotBlank() }
                 } catch (e: Exception) {
                     emptyList()
                 }
@@ -248,16 +250,14 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
             try {
                 val qr = parseQrUri(text)
                 val id = ctx.deviceId()
-                for (host in qr.hosts) {
-                    activity.svcState.value?.connect(
-                        host, qr.port, id,
-                        PairInfo.Qr(
-                            android.util.Base64.encodeToString(qr.token, android.util.Base64.NO_WRAP),
-                            qr.fp,
-                        ),
-                    )
-                    break
-                }
+                activity.svcState.value?.connectHosts(
+                    qr.hosts, qr.port, id,
+                    PairInfo.Qr(
+                        qr.hosts, qr.port,
+                        android.util.Base64.encodeToString(qr.token, android.util.Base64.NO_WRAP),
+                        qr.fp,
+                    ),
+                )
             } catch (e: Exception) {
                 // Bad QR content: stay on screen with a message.
             }
@@ -293,6 +293,9 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
                                 if (addr != null) "found • ${addr.first}" else "not found",
                                 color = if (addr != null) Color(0xFF4CAF50) else Color.Gray,
                             )
+                            // Fingerprint id: compare with the PC log's
+                            // `cert fingerprint sha256:` on mismatch.
+                            Text("cert ${pc.fingerprintHex.take(8)}", color = Color.Gray)
                         }
                         Row {
                             TextButton(onClick = {

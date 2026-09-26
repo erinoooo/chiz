@@ -986,11 +986,11 @@ async fn broadcast_profile(shared: &Arc<Shared>, reason: &str) {
 
 /// Open a pairing window: token + PIN, QR URI on stdout/log, PBM beside the
 /// identity, PIN for manual entry. GUI/tray calls this on "Pair new tablet".
-async fn open_pairing(shared: &Arc<Shared>, fp: &[u8; 32]) {
+async fn open_pairing(shared: &Arc<Shared>, fp: &[u8; 32], port: u16) {
     let (token, pin) = shared.pairing.lock().await.open(now_secs());
     let hosts = local_ipv4_hosts();
     let host_refs: Vec<&str> = hosts.iter().map(String::as_str).collect();
-    let uri = shared.pairing.lock().await.qr_uri(&host_refs, 47800, fp);
+    let uri = shared.pairing.lock().await.qr_uri(&host_refs, port, fp);
     eprintln!("pairing open for 120 s — PIN: {pin}");
     eprintln!("pairing QR: {uri}");
     match pairing::qr_jpg(&uri) {
@@ -1183,7 +1183,7 @@ async fn setup() -> Boot {
     // Pairing window (deliberate action only: tray "Pair new tablet";
     // CHIZ_PAIRING=open is the headless/test equivalent).
     if std::env::var("CHIZ_PAIRING").as_deref() == Ok("open") {
-        open_pairing(&shared, &id.fingerprint).await;
+        open_pairing(&shared, &id.fingerprint, cfg.control_port).await;
     }
 
     let udp = Arc::new(

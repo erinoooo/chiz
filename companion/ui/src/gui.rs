@@ -130,7 +130,8 @@ impl GuiApp {
                 tray_action(&self.shared, if paused { "resume" } else { "pause" });
             }
             PendingAction::PairOpen => {
-                self.rt.block_on(open_pairing(&self.shared, &self.fp));
+                let port = self.port;
+                self.rt.block_on(open_pairing(&self.shared, &self.fp, port));
             }
             PendingAction::ForgetTablet(id) => {
                 {

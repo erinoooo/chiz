@@ -9,6 +9,10 @@ import android.net.nsd.NsdServiceInfo
 class Discovery(context: Context, private val onFound: (name: String, host: String, port: Int) -> Unit) {
     private val nsd = context.getSystemService(Context.NSD_SERVICE) as NsdManager
     private var discovering = false
+    // Without a multicast lock, discovery silently finds nothing on many
+    // devices (spec 6 lists CHANGE_WIFI_MULTICAST_STATE for this reason).
+    private val multicastLock = (context.applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager)
+        .createMulticastLock("chiz-discover").apply { setReferenceCounted(false) }
 
     private val discoveryListener = object : NsdManager.DiscoveryListener {
         override fun onDiscoveryStarted(regType: String) {}
@@ -38,6 +42,10 @@ class Discovery(context: Context, private val onFound: (name: String, host: Stri
         if (discovering) return
         discovering = true
         try {
+            multicastLock.acquire()
+        } catch (e: Exception) {
+        }
+        try {
             nsd.discoverServices("_chiz._tcp.", NsdManager.PROTOCOL_DNS_SD, discoveryListener)
         } catch (e: Exception) {
             discovering = false
@@ -47,6 +55,10 @@ class Discovery(context: Context, private val onFound: (name: String, host: Stri
     fun stop() {
         if (!discovering) return
         discovering = false
+        try {
+            multicastLock.release()
+        } catch (e: Exception) {
+        }
         try {
             nsd.stopServiceDiscovery(discoveryListener)
         } catch (e: Exception) {

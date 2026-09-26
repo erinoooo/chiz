@@ -34,8 +34,11 @@ class ControlChannel(
     private var pinger: Thread? = null
     @Volatile private var closed = false
     private var pingId = 0
+    /** Per-host connect timeout ms (spec 3: 2 s per QR address). */
+    var connectTimeoutMs: Int = 5000
 
     fun connect() {
+        connectTimeoutMs = 5000
         val trust = object : X509TrustManager {
             override fun getAcceptedIssuers() = emptyArray<X509Certificate>()
             override fun checkClientTrusted(c: Array<X509Certificate>, a: String) {}
@@ -54,7 +57,7 @@ class ControlChannel(
         val s = ctx.socketFactory.createSocket() as SSLSocket
         s.enabledProtocols = arrayOf("TLSv1.3")
         s.tcpNoDelay = true
-        s.connect(InetSocketAddress(host, port), 5000)
+        s.connect(InetSocketAddress(host, port), connectTimeoutMs)
         s.startHandshake()
         sock = s
         reader = Thread({ readLoop() }, "chiz-control-reader").apply { isDaemon = true; start() }

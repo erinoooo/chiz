@@ -19,14 +19,56 @@ pub fn data_dir() -> PathBuf {
     if let Ok(d) = std::env::var("CHIZ_DATA_DIR") {
         return d.into();
     }
-    // Production paths (spec 9/10) land with the installer; dev default is
-    // the repo companion/ dir so certs never pollute a real config dir.
+    // Stable per-user locations (spec 9/10) — NEVER CWD-relative alone: a
+    // cert that moves with the working directory regenerates on relaunch
+    // and silently invalidates every pairing (fingerprint mismatch).
+    #[cfg(windows)]
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        return PathBuf::from(appdata).join("Chiz");
+    }
+    #[cfg(unix)]
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("chiz");
+        }
+    }
+    #[cfg(unix)]
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".config").join("chiz");
+        }
+    }
+    // Dev fallback (repo checkout): the old CWD-relative directory.
     for c in ["companion/identity", "identity"] {
         if Path::new(c).is_dir() {
             return c.into();
         }
     }
     PathBuf::from("companion/identity")
+}
+
+/// One-time migration from the old CWD-relative identity (pre-platform-dir
+/// builds): copy the existing cert+key forward so one upgrade doesn't force
+/// a re-pair. Returns true if anything was migrated.
+fn migrate_legacy(dir: &Path) -> bool {
+    if dir.join("cert.der").is_file() && dir.join("key.bin").is_file() {
+        return false; // already home
+    }
+    for c in ["companion/identity", "identity", "./identity"] {
+        let old = Path::new(c);
+        if old.join("cert.der").is_file() && old.join("key.bin").is_file() {
+            if std::fs::create_dir_all(dir).is_err() {
+                return false;
+            }
+            let ok = std::fs::copy(old.join("cert.der"), dir.join("cert.der")).is_ok()
+                && std::fs::copy(old.join("key.bin"), dir.join("key.bin")).is_ok();
+            if ok {
+                eprintln!("migrated identity from {} (delete it)", old.display());
+            }
+            return ok;
+        }
+    }
+    false
 }
 
 /// Load or first-run-generate the identity. Key material always comes from
@@ -37,7 +79,8 @@ pub fn load_or_generate(hostname: &str) -> Result<Identity, String> {
 }
 
 fn load_or_generate_in(dir: &Path, hostname: &str) -> Result<Identity, String> {
-    std::fs::create_dir_all(&dir).map_err(|e| format!("data dir: {e}"))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("data dir: {e}"))?;
+    migrate_legacy(dir);
     let cert_path = dir.join("cert.der");
     let key_path = dir.join("key.bin");
     if cert_path.is_file() && key_path.is_file() {

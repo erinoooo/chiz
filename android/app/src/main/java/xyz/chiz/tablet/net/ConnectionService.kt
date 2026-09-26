@@ -52,9 +52,14 @@ data class ConnState(
 /** How this tablet will prove itself. Set by the UI before connect(). */
 sealed interface PairInfo {
     data class Paired(val secretB64: String, val pinnedFp: ByteArray) : PairInfo
-    data class Qr(val tokenB64: String, val pinnedFp: ByteArray) : PairInfo
+    data class Qr(val hosts: List<String>, val port: Int, val tokenB64: String, val pinnedFp: ByteArray) : PairInfo
     data class Pin(val pin: String) : PairInfo // fp captured from TLS, proof binds it
 }
+
+/** Permanent TLS identity failure: retrying can never succeed. */
+class CertMismatch(msg: String) : Exception(msg)
+
+fun fpShort(fp: ByteArray): String = fp.joinToString("") { "%02x".format(it) }.take(8)
 
 /**
  * Foreground service (type connectedDevice) owning the control socket, pen
@@ -141,6 +146,11 @@ class ConnectionService : Service() {
     fun isPanicCooldown(): Boolean = SystemClock.uptimeMillis() < panicUntil
 
     fun connect(host: String, port: Int, deviceIdIn: String, info: PairInfo) {
+        connectHosts(listOf(host), port, deviceIdIn, info)
+    }
+
+    /** Multi-host connect (QR lists): tries each address in order. */
+    fun connectHosts(hosts: List<String>, port: Int, deviceIdIn: String, info: PairInfo) {
         if (isPanicCooldown()) {
             _state.value = ConnState("error", "", "Panic cooldown: wait 5 s")
             return
@@ -149,19 +159,23 @@ class ConnectionService : Service() {
         wantStop = false
         deviceId = deviceIdIn
         pairInfo = info
-        _state.value = ConnState("connecting", host, "")
-        hostAddr = host
+        _state.value = ConnState("connecting", hosts.firstOrNull() ?: "", "")
+        hostAddr = hosts.firstOrNull() ?: ""
         portSeen = port
         connectJob = scope.launch {
             var attempt = 0
             while (!wantStop && _state.value.status != "connected") {
                 try {
-                    runSession(host, port)
+                    runSession(hosts, port)
                     return@launch
                 } catch (e: StopLoop) {
                     return@launch // clean disconnect / fatal error: no retry
+                } catch (e: CertMismatch) {
+                    _state.value = ConnState("error", "", e.message ?: "certificate mismatch")
+                    wantStop = true
+                    return@launch // permanent: never hammer a wrong cert
                 } catch (e: Exception) {
-                    _state.value = ConnState("reconnecting", host, e.message ?: "connection failed")
+                    _state.value = ConnState("reconnecting", hostAddr, e.message ?: "connection failed")
                     delay((reconnectDelay(attempt++) * 1000).toLong())
                 }
             }
@@ -172,8 +186,9 @@ class ConnectionService : Service() {
 
     /** One session attempt: TLS + challenge; the message callbacks drive it.
      * After `welcome` this parks until the transport dies or a clean stop,
-     * so mid-session drops reconnect instead of silently ending. */
-    private fun runSession(host: String, port: Int) {
+     * so mid-session drops reconnect instead of silently ending.
+     * QR lists are tried in order, 2 s each (spec 3). */
+    private fun runSession(hosts: List<String>, port: Int) {
         val info = pairInfo ?: throw StopLoop()
         val pinned: ByteArray? = when (info) {
             is PairInfo.Paired -> info.pinnedFp
@@ -181,22 +196,48 @@ class ConnectionService : Service() {
             is PairInfo.Pin -> null // capture observed fp for the proof
         }
         if (info is PairInfo.Paired) secretB64 = info.secretB64
-        phase = "wait_challenge"
-        armDeadline()
-        val ch = ControlChannel(host, port, pinned, ::onControlMessage, ::onDead) {
-            pingSent[it] = SystemClock.uptimeMillis()
-        }
-        ch.connect()
-        control = ch
-        holdLocks()
-        while (!wantStop && phase != "dead") {
-            if (phase != "connected" && SystemClock.uptimeMillis() > connectDeadline()) {
-                throw Exception("handshake timeout")
+        var lastErr: Exception? = null
+        for (host in hosts) {
+            if (wantStop) throw StopLoop()
+            hostAddr = host
+            phase = "wait_challenge"
+            armDeadline()
+            val ch = ControlChannel(host, port, pinned, ::onControlMessage, ::onDead) {
+                pingSent[it] = SystemClock.uptimeMillis()
             }
-            Thread.sleep(200)
+            ch.connectTimeoutMs = 2000
+            try {
+                ch.connect()
+            } catch (e: Exception) {
+                if (e.message?.contains("fingerprint mismatch") == true ||
+                    e.cause?.message?.contains("fingerprint mismatch") == true
+                ) {
+                    val want = pinned?.let { fpShort(it) } ?: "?"
+                    val got = ch.observedFp?.let { fpShort(it) } ?: "?"
+                    throw CertMismatch(
+                        "Certificate mismatch (tablet expects $want, PC showed $got). " +
+                            "The PC's certificate changed — forget this PC and pair again.",
+                    )
+                }
+                lastErr = Exception("connect $host failed: ${e.message}")
+                continue
+            }
+            control = ch
+            holdLocks()
+            while (!wantStop && phase != "dead") {
+                if (phase != "connected" && SystemClock.uptimeMillis() > connectDeadline()) {
+                    control?.close()
+                    lastErr = Exception("handshake timeout")
+                    break
+                }
+                Thread.sleep(200)
+            }
+            if (wantStop) throw StopLoop()
+            // Dead transport (mid-session drop or pre-welcome loss):
+            // retry with the next host, then the whole list.
+            lastErr = Exception("connection lost")
         }
-        if (wantStop) throw StopLoop()
-        throw Exception("connection lost")
+        throw lastErr ?: Exception("no route to PC")
     }
 
     @Volatile private var deadlineAt = 0L
