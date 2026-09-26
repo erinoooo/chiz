@@ -1,3 +1,5 @@
+@file:OptIn(ExperimentalMaterial3Api::class)
+
 package xyz.chiz.tablet.ui
 
 import android.Manifest
@@ -27,6 +29,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -656,7 +659,7 @@ fun SettingsScreen(back: () -> Unit) {
             IconButton(onClick = { save(); back() }) { Icon(Icons.Default.ArrowBack, "Back") }
         })
     }) { pad ->
-        LazyColumn(Modifier.fillMaxSize().padding(pad).padding(16.dp), Arrangement.spacedBy(12.dp)) {
+        LazyColumn(Modifier.fillMaxSize().padding(pad).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item {
                 Text("Strip edge")
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -695,7 +698,7 @@ fun SettingsScreen(back: () -> Unit) {
                 Text("Announce mode")
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf("rest", "touch").forEach { a ->
-                        FilterChip(a == announce, { announce = it; save() }, { Text(a) })
+                        FilterChip(a == announce, { announce = a; save() }, { Text(a) })
                     }
                 }
             }
