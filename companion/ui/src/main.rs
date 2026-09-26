@@ -102,21 +102,10 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Crypto-random bytes from the OS (spec 12.1). Linux: /dev/urandom;
-/// portability hook: prefer `getrandom`/`rand` crate on Windows builds.
+/// Crypto-random bytes from the OS (spec 12.1): `getrandom`, i.e.
+/// getrandom(2) on Linux, BCryptGenRandom on Windows.
 fn os_random(buf: &mut [u8]) {
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(buf))
-            .expect("OS CSPRNG unavailable");
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows: replace with BCryptGenRandom / `rand` crate before release.
-        panic!("OS CSPRNG hook not wired for this platform");
-    }
+    getrandom::getrandom(buf).expect("OS CSPRNG unavailable");
 }
 
 struct Shared {

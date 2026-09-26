@@ -228,6 +228,7 @@ version = "1.0.0"
 dependencies = [
  "chiz-core",
  "egui",
+ "getrandom 0.2.17",
  "mdns-sd",
  "qrcodegen",
  "rcgen",

@@ -14,6 +14,7 @@ time = "0.3"
 mdns-sd = "0.21"
 qrcodegen = "1.8"
 egui = "0.32"
+getrandom = "0.2"
 
 [dev-dependencies]
 # TLS1.2-only client for the no-fallback test (features unify with above).
