@@ -35,8 +35,10 @@ jobs:
       - name: kotlin protocol tests
         run: |
           rm -rf /tmp/kt-out && mkdir -p /tmp/kt-out
-          /tmp/kotlin/kotlinc/bin/kotlinc android/app/src/main/java/xyz/chiz/tablet/proto/*.kt android/jvmtest/TestMain.kt -d /tmp/kt-out
-          java -cp "/tmp/kt-out:/tmp/kotlin/kotlinc/lib/kotlin-stdlib.jar" xyz.chiz.tablet.jvmtest.TestMainKt
+          curl -sSL -o /tmp/json.jar https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar
+          CP="/tmp/kotlin/kotlinc/lib/kotlin-stdlib.jar:/tmp/json.jar"
+          /tmp/kotlin/kotlinc/bin/kotlinc android/app/src/main/java/xyz/chiz/tablet/proto/*.kt android/jvmtest/TestMain.kt -cp "$CP" -d /tmp/kt-out
+          java -cp "/tmp/kt-out:$CP" xyz.chiz.tablet.jvmtest.TestMainKt
 
   build-linux:
     needs: test
