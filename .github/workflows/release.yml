@@ -1,0 +1,121 @@
+name: build-and-release
+
+# Tests run on every push/PR. Release binaries are built and attached to a
+# GitHub Release whenever a version tag (v*) is pushed.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: rust tests
+        working-directory: companion
+        run: cargo test --workspace
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install cryptography
+      - name: protocol vectors
+        run: python3 protocol/verify_m0.py && python3 protocol/verify_m1m2.py
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: install kotlinc
+        run: |
+          curl -sSL -o /tmp/kotlin.zip https://github.com/JetBrains/kotlin/releases/download/v2.1.20/kotlin-compiler-2.1.20.zip
+          unzip -q /tmp/kotlin.zip -d /tmp/kotlin
+      - name: kotlin protocol tests
+        run: |
+          rm -rf /tmp/kt-out && mkdir -p /tmp/kt-out
+          /tmp/kotlin/kotlinc/bin/kotlinc android/app/src/main/java/xyz/chiz/tablet/proto/*.kt android/jvmtest/TestMain.kt -d /tmp/kt-out
+          java -cp "/tmp/kt-out:/tmp/kotlin/kotlinc/lib/kotlin-stdlib.jar" xyz.chiz.tablet.jvmtest.TestMainKt
+
+  build-linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: release build
+        working-directory: companion
+        run: cargo build --release -p chiz-ui
+      - name: stage artifacts
+        run: |
+          mkdir -p dist
+          cp companion/target/release/chiz-ui dist/chiz-ui-linux-x86_64
+          (cd dist && sha256sum chiz-ui-linux-x86_64 > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/
+
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: release build
+        working-directory: companion
+        run: cargo build --release -p chiz-ui
+      - name: stage artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item companion\target\release\chiz-ui.exe dist\chiz-ui-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/
+
+  build-android:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: install platform + build-tools
+        run: |
+          yes | sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: assemble debug APK
+        working-directory: android
+        run: gradle :app:assembleDebug
+      - name: stage artifacts
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/chiz-tablet-debug.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build-linux, build-windows, build-android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - name: checksums
+        run: (cd dist && sha256sum * > SHA256SUMS)
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

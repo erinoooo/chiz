@@ -1,0 +1,27 @@
+[package]
+name = "chiz-ui"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+chiz-core = { path = "../core" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync", "io-util"] }
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = "0.26"
+rcgen = "0.14"
+time = "0.3"
+mdns-sd = "0.21"
+qrcodegen = "1.8"
+egui = "0.32"
+
+[dev-dependencies]
+# TLS1.2-only client for the no-fallback test (features unify with above).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# M6-M7 wiring (not yet compiled in): TLS identity, discovery, QR, tray, UI.
+# egui = "0.29"
+# tray-icon = "0.19"
+# qrcode = "0.14"
+# mdns-sd = "0.13"
+# rustls = "0.23"
+# rcgen = "0.13"

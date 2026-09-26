@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "pen_vector": {
+    "device_secret_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "pen_key_salt_hex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+    "session_id": 1093482,
+    "seq": 1,
+    "pen_key_hex": "0fcc4ff1babc2af33fbfa107f14f14632e88eafcc4624d87f11072ca74e777d9",
+    "record": {
+      "phase": "down",
+      "phase_value": 1,
+      "eraser": false,
+      "barrel1": false,
+      "barrel2": false,
+      "x": 32768,
+      "y": 16384,
+      "pressure": 8192,
+      "tilt_x": 15,
+      "tilt_y": -10,
+      "distance": 0,
+      "t_ms": 1234
+    },
+    "plaintext_hex": "0101000080004000200ff60000d2040000",
+    "nonce_hex": "010000000000000000000000",
+    "aad_hex": "c1006aaf100001000000",
+    "datagram_hex": "c1006aaf1000010000008042b5e368236419bdc1a62d3f80e2e3c0b136f1c90ea1278848a0bff1f7232524"
+  },
+  "auth_vector": {
+    "device_secret_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "nonce_hex": "000102030405060708090a0b0c0d0e0f",
+    "nonce_base64": "AAECAwQFBgcICQoLDA0ODw==",
+    "device_id": "5b0f6c1e-7d0a-4a55-9d3e-0c6f1a2b3c4d",
+    "auth_base64": "DdLGZwJqsXzvI3MQKJX9vL5d9LJnGT4eYPCx6kTgps8="
+  },
+  "pin_proof_vector": {
+    "pin": "12345678",
+    "fp_seen_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "nonce_hex": "000102030405060708090a0b0c0d0e0f",
+    "device_id": "5b0f6c1e-7d0a-4a55-9d3e-0c6f1a2b3c4d",
+    "proof_base64": "XDbvfPmZHgCAs32kb3NRxh11K7eINs+TazjCRsV116Y="
+  },
+  "mapping_cases": [
+    {"pen_area": [2100, 1600], "rotation": 0, "input": [0.5, 0.5], "monitor": [1920, 1080], "expect": [960, 540]},
+    {"pen_area": [2100, 1600], "rotation": 0, "input": [0.0, 0.0], "monitor": [1920, 1080], "expect": [0, 0]},
+    {"pen_area": [2100, 1600], "rotation": 0, "input": [0.25, 0.25], "monitor": [1920, 1080], "expect": [480, 174]},
+    {"pen_area": [2100, 1600], "rotation": 0, "input": [1.0, 1.0], "monitor": [1920, 1080], "expect": [1919, 1079]},
+    {"pen_area": [1600, 2100], "rotation": 90, "input": [0.25, 0.75], "monitor": [1920, 1080], "expect": [480, 174]}
+  ],
+  "curve_cases": [
+    {"curve": [0.25, 0.25, 0.75, 0.75], "name": "linear", "p": [0.25, 0.5, 0.75], "expect": [0.25, 0.5, 0.75]},
+    {"curve": [0.10, 0.40, 0.50, 0.90], "name": "soft", "p": [0.25, 0.5, 0.75], "expect": [0.4946, 0.7532, 0.9145]},
+    {"curve": [0.50, 0.10, 0.90, 0.50], "name": "firm", "p": [0.25, 0.5, 0.75], "expect": [0.0781, 0.2213, 0.4622]}
+  ]
+}

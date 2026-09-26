@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "ports": { "control": 47800, "pen": 47801 },
+  "start_at_login": false,
+  "log_level": "info",
+  "mapping": {
+    "monitor": "primary",
+    "area": { "x": 0, "y": 0, "w": 1, "h": 1 },
+    "keep_aspect": true,
+    "rotation": 0
+  },
+  "pressure_curve": [0.25, 0.25, 0.75, 0.75],
+  "profile_lock": null,
+  "panic_hotkey": "ctrl+alt+shift+f12"
+}

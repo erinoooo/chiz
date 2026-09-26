@@ -1,0 +1,21 @@
+# Rust
+companion/target/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.iml
+# Secrets and local device state (never commit)
+companion/identity/
+paired.json
+key.bin
+cert.der
+pair_qr.pbm
+# Logs and scratch
+*.log
+.DS_Store
