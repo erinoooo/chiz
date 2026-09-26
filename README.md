@@ -1,10 +1,11 @@
 <div align="center">
 
-<img width="432" height="432" alt="chiznewlogo" src="https://github.com/user-attachments/assets/53c6612c-4f3d-46a3-abf8-fb4c74924444" />
+<img width="432" height="432" alt="chiznewfixedlogo" src="https://github.com/user-attachments/assets/edc33b9f-3345-4802-b983-a201d0303a8b" />
 
 # Chiz
 
-[![build-and-release](https://github.com/erinoooo/chiz/actions/workflows/release.yml/badge.svg)](https://github.com/erinoooo/chiz/actions/workflows/release.yml)
+[![build-and-release](https://github.com/erinoooo/chi![Uploading chiznewfixedlogo.png…]()
+z/actions/workflows/release.yml/badge.svg)](https://github.com/erinoooo/chiz/actions/workflows/release.yml)
 
 </div>
 
