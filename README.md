@@ -1,6 +1,6 @@
 <div align="center">
 
-<img width="432" height="432" alt="chiznewfixedlogo" src="https://github.com/user-attachments/assets/edc33b9f-3345-4802-b983-a201d0303a8b" />
+<img width="160" alt="Chiz logo: a pen nib drawing between two offset frames" src="docs/logo.svg" />
 
 # Chiz
 

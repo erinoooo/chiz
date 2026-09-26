@@ -1,0 +1,33 @@
+<!-- Material You themed-icon layer (API 33+): the pen-nib mark from
+     docs/logo.svg redrawn as a single-color alpha mask. The launcher tints
+     it with the wallpaper palette; keep exactly one opaque color here. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:pathData="M47.3261,43H77L68.2609,70L38,67.1889L47.3261,43Z"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.5"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M39.3261,38H69L60.2609,64L30,61.293L39.3261,38Z"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.5"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M39.1601,59C38.6094,55.3204 39.1728,48.7266 45.8325,51.788C52.4922,54.8494 55.3857,56.7432 56,57.3074"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M56.2524,57.4145L54.3665,55.5983L55.6776,54.8601L56.2524,57.4145Z"
+        android:fillColor="#FFFFFF" />
+    <path
+        android:pathData="M54.3665,55.5983L46,40.7382L47.3112,40L55.6777,54.8601L54.3665,55.5983Z"
+        android:fillColor="#FFFFFF" />
+</vector>
