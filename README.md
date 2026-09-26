@@ -4,8 +4,7 @@
 
 # Chiz
 
-[![build-and-release](https://github.com/erinoooo/chi![Uploading chiznewfixedlogo.png…]()
-z/actions/workflows/release.yml/badge.svg)](https://github.com/erinoooo/chiz/actions/workflows/release.yml)
+[![build-and-release](https://github.com/erinoooo/chiz/actions/workflows/release.yml/badge.svg)](https://github.com/erinoooo/chiz/actions/workflows/release.yml)
 
 </div>
 
