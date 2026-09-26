@@ -6,12 +6,12 @@ plugins {
 
 android {
     namespace = "xyz.chiz.tablet"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "xyz.chiz.tablet"
         minSdk = 29 // Android 10: TLS 1.3 in the platform SSLSocket (spec 6)
-        targetSdk = 34
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
     }
