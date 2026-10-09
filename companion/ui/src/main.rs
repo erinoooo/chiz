@@ -14,10 +14,16 @@
 // Release builds on Windows are GUI-subsystem: no stray console window.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+/// Shadows `std::eprintln!` for the whole crate: stderr + `chiz.log`.
+macro_rules! eprintln {
+    ($($arg:tt)*) => { $crate::logging::line(format_args!($($arg)*)) };
+}
+
 mod control;
 mod gui;
 mod identity;
 mod inject;
+mod logging;
 mod mdns;
 mod pairing;
 mod pen;
@@ -845,9 +851,14 @@ where
         if matches!(stage, ConnStage::Unauth { .. })
             && accept_at.elapsed() > Duration::from_secs_f64(control::HANDSHAKE_DEADLINE_SECS)
         {
+            eprintln!("{peer}: closed (no authentication within 10 s)");
             break; // 10 s handshake limit
         }
         if last_rx.elapsed() > Duration::from_secs_f64(control::DEAD_AFTER_SECS) {
+            eprintln!(
+                "{peer}: closed (nothing received for {} s)",
+                control::DEAD_AFTER_SECS
+            );
             break; // dead connection
         }
         let msg =
@@ -855,8 +866,14 @@ where
                 .await
             {
                 Ok(Ok(Some(v))) => v,
-                Ok(Ok(None)) => break, // EOF
-                Ok(Err(_)) => break,
+                Ok(Ok(None)) => {
+                    eprintln!("{peer}: closed by the tablet");
+                    break;
+                }
+                Ok(Err(e)) => {
+                    eprintln!("{peer}: closed ({e})");
+                    break;
+                }
                 Err(_) => {
                     // Timeout tick: re-check deadlines + pump server frames.
                     let mut pending = vec![];
@@ -1044,6 +1061,7 @@ where
                                 break;
                             }
                         }
+                        eprintln!("{peer}: session {sid} started for {device_id}");
                         stage = ConnStage::Authed { session_id: sid };
                         release_unauth(shared.as_ref()).await;
                     }
@@ -1493,6 +1511,8 @@ fn install_panic_hotkey(shared: &Arc<Shared>) {
 }
 
 fn main() {
+    logging::init();
+    eprintln!("Chiz {} starting", env!("CARGO_PKG_VERSION"));
     #[cfg(windows)]
     chiz_platform_windows::init_dpi_awareness();
     // Manual runtime (not #[tokio::main]): the GUI event loop runs on the

@@ -84,6 +84,15 @@ class ControlChannel(
         }
     }
 
+    /** Why the link ended, for the UI and logs ("" while alive). */
+    @Volatile var deathReason: String = ""
+        private set
+
+    private fun die(reason: String) {
+        if (deathReason.isEmpty()) deathReason = reason
+        onDead()
+    }
+
     private fun readLoop() {
         val s = sock ?: return
         val input = s.inputStream
@@ -97,33 +106,45 @@ class ControlChannel(
                     input.read(tmp)
                 } catch (e: java.net.SocketTimeoutException) {
                     if (System.currentTimeMillis() - lastRx > 5000) {
-                        onDead()
+                        die("no data from the PC for 5 s")
                         return
                     }
                     continue
                 }
                 if (n < 0) {
-                    onDead()
+                    if (!closed) die("the PC closed the connection")
                     return
                 }
+                // Any bytes prove the link is alive, even a half-delivered frame.
+                lastRx = System.currentTimeMillis()
                 buf.write(tmp, 0, n)
-                val bytes = buf.toByteArray()
-                try {
-                    val (msg, used) = decodeFrame(bytes)
-                    onMessage(msg)
-                    lastRx = System.currentTimeMillis()
-                    buf.reset()
-                    if (used < bytes.size) buf.write(bytes, used, bytes.size - used)
-                } catch (e: IllegalArgumentException) {
-                    if (e.message == "oversize") {
-                        onDead()
-                        return
+                val data = buf.toByteArray()
+                var off = 0
+                // Drain EVERY complete frame: several often arrive in one read.
+                while (true) {
+                    val frame = try {
+                        decodeFrame(data, off)
+                    } catch (e: IllegalArgumentException) {
+                        if (e.message == "oversize") {
+                            die("oversize frame from the PC")
+                            return
+                        }
+                        break // incomplete: wait for more bytes
                     }
-                    // incomplete: keep buffering
+                    // A throwing handler must not be mistaken for "incomplete"
+                    // (that re-delivered the frame forever and starved lastRx).
+                    try {
+                        onMessage(frame.first)
+                    } catch (e: Exception) {
+                        System.err.println("chiz: message handler failed: $e") // logcat shows System.err
+                    }
+                    off += frame.second
                 }
+                buf.reset()
+                if (off < data.size) buf.write(data, off, data.size - off)
             }
         } catch (e: Exception) {
-            if (!closed) onDead()
+            if (!closed) die("read error: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 

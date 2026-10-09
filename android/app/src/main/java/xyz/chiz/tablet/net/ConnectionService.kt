@@ -250,7 +250,7 @@ class ConnectionService : Service() {
             if (wantStop) throw StopLoop()
             // Dead transport (mid-session drop or pre-welcome loss):
             // retry with the next host, then the whole list.
-            lastErr = Exception("connection lost")
+            lastErr = Exception("connection lost (${ch.deathReason.ifEmpty { "unknown" }})")
         }
         mismatch?.let {
             hostAddr = mismatchAt
@@ -273,7 +273,10 @@ class ConnectionService : Service() {
         releaseLocks()
         phase = "dead" // runSession's waiter retries; live sessions reconnect
         if (!wantStop && _state.value.status == "connected") {
-            _state.value = _state.value.copy(status = "reconnecting", message = "connection lost")
+            _state.value = _state.value.copy(
+                status = "reconnecting",
+                message = "connection lost (${control?.deathReason?.ifEmpty { null } ?: "unknown"})",
+            )
             audio.speak("Disconnected")
             audio.earcon("disconnect")
         }
