@@ -161,7 +161,7 @@ mod tests {
         assert_eq!(s.repair(Hover, false), vec![Up, Hover]); // hover in contact
         assert_eq!(PenState::default().repair(Up, false), vec![]); // dup up
         assert_eq!(PenState::default().repair(Leave, false), vec![]); // dup leave
-        // Tool switch mid-contact forces up+leave first.
+                                                                      // Tool switch mid-contact forces up+leave first.
         let mut s = PenState {
             in_range: true,
             in_contact: true,

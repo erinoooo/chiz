@@ -82,15 +82,13 @@ pub struct PenPacket {
 
 /// Pure builder: repair + packetize one record. Tested on Linux; the only
 /// Windows-only step is the final struct fill.
-pub fn build_packets(state: &mut PenState, ev: &PenEvent, first_of_range: &mut bool) -> Vec<PenPacket> {
+pub fn build_packets(
+    state: &mut PenState,
+    ev: &PenEvent,
+    first_of_range: &mut bool,
+) -> Vec<PenPacket> {
     use PenPhase::*;
-    let phase = match ev.phase {
-        Hover => Hover,
-        Down => Down,
-        Move => Move,
-        Up => Up,
-        Leave => Leave,
-    };
+    let phase = ev.phase;
     let mut out = vec![];
     for ph in state.repair(phase, ev.eraser) {
         let first = *first_of_range && ph == Hover;
@@ -106,7 +104,11 @@ pub fn build_packets(state: &mut PenState, ev: &PenEvent, first_of_range: &mut b
             y: ev.y_px as i32, // virtual-desktop physical px (may be negative)
             flags: pointer_flags(ph, first, ev.barrel1),
             mask: PEN_MASK_PRESSURE | PEN_MASK_TILT_X | PEN_MASK_TILT_Y,
-            pressure: if touching { pressure_win(ev.pressure) } else { 0 },
+            pressure: if touching {
+                pressure_win(ev.pressure)
+            } else {
+                0
+            },
             tilt_x: ev.tilt_x as i32,
             tilt_y: ev.tilt_y as i32,
             pen_flags: pen_flags(ev.eraser, touching, ev.barrel1),
@@ -164,12 +166,17 @@ pub fn map_scan(vk: u16) -> u16 {
         0x26 => 0xC8, // up
         0x27 => 0xCD, // right
         0x28 => 0xD0, // down
-        v if (0x41..=0x5A).contains(&v) => [0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17,
-            0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13, 0x1F, 0x14,
-            0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C][(v - 0x41) as usize],
-        v if (0x30..=0x39).contains(&v) => [0x0B, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A][(v - 0x30) as usize],
-        v if (0x70..=0x87).contains(&v) => [0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x41, 0x42, 0x43, 0x44,
-            0x57, 0x58, 0x7E, 0x7F, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89][(v - 0x70) as usize],
+        v if (0x41..=0x5A).contains(&v) => [
+            0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31,
+            0x18, 0x19, 0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C,
+        ][(v - 0x41) as usize],
+        v if (0x30..=0x39).contains(&v) => {
+            [0x0B, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A][(v - 0x30) as usize]
+        }
+        v if (0x70..=0x87).contains(&v) => [
+            0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x41, 0x42, 0x43, 0x44, 0x57, 0x58, 0x7E, 0x7F,
+            0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+        ][(v - 0x70) as usize],
         _ => 0,
     }
 }
@@ -210,7 +217,7 @@ impl Platform for WindowsPlatform {
     fn monitors(&mut self) -> Vec<Monitor> {
         #[cfg(windows)]
         {
-            return enum_monitors();
+            enum_monitors()
         }
         #[cfg(not(windows))]
         {
@@ -276,7 +283,7 @@ impl Platform for WindowsPlatform {
                     eprintln!("{a} runs as administrator, so Chiz cannot control it. Run Chiz as administrator too.");
                 }
             }
-            return app;
+            app
         }
         #[cfg(not(windows))]
         {
@@ -287,8 +294,13 @@ impl Platform for WindowsPlatform {
     fn release_all(&mut self) {
         #[cfg(windows)]
         {
-            for vk in self.held_keys.drain(..).collect::<Vec<_>>() {
-                send_strokes(&[KeyStroke { vk, scan: map_scan(vk), extended: false, up: true }]);
+            for vk in std::mem::take(&mut self.held_keys) {
+                send_strokes(&[KeyStroke {
+                    vk,
+                    scan: map_scan(vk),
+                    extended: false,
+                    up: true,
+                }]);
             }
             for b in self.held_mouse.drain().collect::<Vec<_>>() {
                 send_mouse(&b, false);
@@ -327,8 +339,10 @@ fn inject_packet(
         None => return,
     };
     // Zeroed then filled per the spec 9 table (rotation unused: 0).
-    let mut info = POINTER_TYPE_INFO::default();
-    info.r#type = PT_PEN;
+    let mut info = POINTER_TYPE_INFO {
+        r#type: PT_PEN,
+        ..Default::default()
+    };
     unsafe {
         let pen = &mut info.Anonymous.penInfo;
         pen.pointerInfo.pointerType = PT_PEN;
@@ -370,8 +384,15 @@ fn send_strokes(strokes: &[KeyStroke]) {
                 ki: KEYBDINPUT {
                     wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(s.vk),
                     wScan: s.scan,
-                    dwFlags: (if s.up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) })
-                        | if s.extended { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) },
+                    dwFlags: (if s.up {
+                        KEYEVENTF_KEYUP
+                    } else {
+                        KEYBD_EVENT_FLAGS(0)
+                    }) | if s.extended {
+                        KEYEVENTF_EXTENDEDKEY
+                    } else {
+                        KEYBD_EVENT_FLAGS(0)
+                    },
                     time: 0,
                     dwExtraInfo: 0,
                 },
@@ -416,12 +437,17 @@ fn send_mouse(button: &str, down: bool) {
 
 #[cfg(windows)]
 fn enum_monitors() -> Vec<Monitor> {
+    use windows::core::BOOL;
     use windows::Win32::Foundation::*;
     use windows::Win32::Graphics::Gdi::*;
     use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
-    use windows::core::BOOL;
     struct Acc(Vec<Monitor>);
-    unsafe extern "system" fn cb(hmon: HMONITOR, _hdc: HDC, _rect: *mut RECT, data: LPARAM) -> BOOL {
+    unsafe extern "system" fn cb(
+        hmon: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
         let acc = &mut *(data.0 as *mut Acc);
         // MONITORINFOEXW starts with MONITORINFO: pass its head and set
         // cbSize to the full extended size so szDevice comes back too.
@@ -455,9 +481,9 @@ fn enum_monitors() -> Vec<Monitor> {
 
 #[cfg(windows)]
 fn foreground_exe() -> Option<String> {
+    use windows::core::PWSTR;
     use windows::Win32::System::Threading::*;
     use windows::Win32::UI::WindowsAndMessaging::*;
-    use windows::core::PWSTR;
     unsafe {
         let hwnd = GetForegroundWindow();
         let mut pid = 0u32;
@@ -465,7 +491,8 @@ fn foreground_exe() -> Option<String> {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 512];
         let mut len = buf.len() as u32;
-        QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).ok()?;
+        QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
+            .ok()?;
         let path = String::from_utf16_lossy(&buf[..len as usize]);
         let base = path.rsplit(['\\', '/']).next().unwrap_or("").to_lowercase();
         if base.is_empty() {
@@ -535,28 +562,78 @@ fn ensure_device(_p: &mut WindowsPlatform) {
     ensure_device_impl(_p);
 }
 
-/// OS panic-hook entry: RegisterHotKey message loop on a std::thread.
+/// Opt into per-monitor-v2 DPI awareness (spec 9) so monitor sizes and
+/// injected coordinates are physical pixels. Must run before any window or
+/// monitor query; no-op elsewhere and when the manifest already set it.
+pub fn init_dpi_awareness() {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::HiDpi::*;
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+/// Foreground process image name (lowercase), `None` when unknown.
+pub fn foreground_app_name() -> Option<String> {
+    #[cfg(windows)]
+    {
+        foreground_exe()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// OS panic-hook entry: `RegisterHotKey` message loop on a std::thread.
+/// Returns false if the hotkey is invalid or another app already owns it
+/// (reported synchronously, so the caller can tell the user).
 #[cfg(windows)]
-pub fn spawn_panic_hook(on_panic: impl Fn() + Send + 'static) {
+pub fn spawn_panic_hook(hotkey: &[String], on_panic: impl Fn() + Send + 'static) -> bool {
+    use std::sync::mpsc;
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
     use windows::Win32::UI::WindowsAndMessaging::*;
-    std::thread::spawn(move || unsafe {
-        if RegisterHotKey(None, 1, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 0x7B).is_err() {
-            eprintln!("panic hotkey registration failed; use tray Emergency release");
-            return;
-        }
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if msg.message == WM_HOTKEY {
-                on_panic();
+    let Some((main, mods)) = hotkey.split_last() else {
+        return false;
+    };
+    let mut flags = MOD_NOREPEAT;
+    for m in mods {
+        flags |= match m.as_str() {
+            "ctrl" => MOD_CONTROL,
+            "alt" => MOD_ALT,
+            "shift" => MOD_SHIFT,
+            "meta" => MOD_WIN,
+            _ => return false,
+        };
+    }
+    let Some((vk, _)) = chiz_core::profile::key_codes(main) else {
+        return false;
+    };
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("chiz-panic-hotkey".into())
+        .spawn(move || unsafe {
+            let ok = RegisterHotKey(None, 1, flags, vk as u32).is_ok();
+            let _ = tx.send(ok);
+            if !ok {
+                return;
             }
-        }
-    });
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                if msg.message == WM_HOTKEY {
+                    on_panic();
+                }
+            }
+        })
+        .is_ok();
+    spawned && rx.recv().unwrap_or(false)
 }
 
 /// Non-Windows stub: documents the contract only.
 #[cfg(not(windows))]
-pub fn spawn_panic_hook(_on_panic: impl Fn() + Send + 'static) {}
+pub fn spawn_panic_hook(_hotkey: &[String], _on_panic: impl Fn() + Send + 'static) -> bool {
+    false
+}
 
 #[cfg(not(windows))]
 fn ensure_device(_p: &mut WindowsPlatform) {}
@@ -568,21 +645,42 @@ mod tests {
 
     #[test]
     fn phase_flags_match_spec_table() {
-        assert_eq!(pointer_flags(PenPhase::Hover, true, false), PF_INRANGE | PF_UPDATE | PF_NEW);
-        assert_eq!(pointer_flags(PenPhase::Down, false, false), 0x0002 | 0x0004 | 0x0010 | 0x1_0000);
-        assert_eq!(pointer_flags(PenPhase::Move, false, false), 0x0002 | 0x0004 | 0x0010 | 0x2_0000);
-        assert_eq!(pointer_flags(PenPhase::Up, false, false), PF_INRANGE | PF_UP);
+        assert_eq!(
+            pointer_flags(PenPhase::Hover, true, false),
+            PF_INRANGE | PF_UPDATE | PF_NEW
+        );
+        assert_eq!(
+            pointer_flags(PenPhase::Down, false, false),
+            0x0002 | 0x0004 | 0x0010 | 0x1_0000
+        );
+        assert_eq!(
+            pointer_flags(PenPhase::Move, false, false),
+            0x0002 | 0x0004 | 0x0010 | 0x2_0000
+        );
+        assert_eq!(
+            pointer_flags(PenPhase::Up, false, false),
+            PF_INRANGE | PF_UP
+        );
         assert_eq!(pointer_flags(PenPhase::Leave, false, false), PF_UPDATE);
         // Barrel1 adds SECONDBUTTON on hover/down/move only.
-        assert_eq!(pointer_flags(PenPhase::Down, false, true) & PF_SECONDBUTTON, PF_SECONDBUTTON);
-        assert_eq!(pointer_flags(PenPhase::Up, false, true) & PF_SECONDBUTTON, 0);
+        assert_eq!(
+            pointer_flags(PenPhase::Down, false, true) & PF_SECONDBUTTON,
+            PF_SECONDBUTTON
+        );
+        assert_eq!(
+            pointer_flags(PenPhase::Up, false, true) & PF_SECONDBUTTON,
+            0
+        );
     }
 
     #[test]
     fn pen_flags_and_pressure() {
         assert_eq!(pen_flags(false, false, false), 0);
         assert_eq!(pen_flags(true, false, false), PEN_FLAG_INVERTED);
-        assert_eq!(pen_flags(true, true, true), PEN_FLAG_BARREL | PEN_FLAG_INVERTED | PEN_FLAG_ERASER);
+        assert_eq!(
+            pen_flags(true, true, true),
+            PEN_FLAG_BARREL | PEN_FLAG_INVERTED | PEN_FLAG_ERASER
+        );
         assert_eq!(pressure_win(0.5), 512);
         assert_eq!(pressure_win(1.0), 1024);
         assert_eq!(pressure_win(0.0), 0);
@@ -608,7 +706,10 @@ mod tests {
         assert_eq!(pk.len(), 2); // hover (NEW) then down
         assert_eq!(pk[0].flags & PF_NEW, PF_NEW);
         assert_eq!(pk[1].pressure, 512);
-        let up = PenEvent { phase: PenPhase::Up, ..ev };
+        let up = PenEvent {
+            phase: PenPhase::Up,
+            ..ev
+        };
         let pk2 = build_packets(&mut st, &up, &mut first);
         assert_eq!(pk2.len(), 1);
         assert_eq!(build_packets(&mut st, &up, &mut first).len(), 0); // dup up

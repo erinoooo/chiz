@@ -67,13 +67,33 @@ pub fn key_codes(name: &str) -> Option<(u16, u16)> {
                 }
                 if c.is_ascii_lowercase() {
                     let ev = match c {
-                        b'a' => 30, b'b' => 48, b'c' => 46, b'd' => 32,
-                        b'e' => 18, b'f' => 33, b'g' => 34, b'h' => 35,
-                        b'i' => 23, b'j' => 36, b'k' => 37, b'l' => 38,
-                        b'm' => 50, b'n' => 49, b'o' => 24, b'p' => 25,
-                        b'q' => 16, b'r' => 19, b's' => 31, b't' => 20,
-                        b'u' => 22, b'v' => 47, b'w' => 17, b'x' => 45,
-                        b'y' => 21, b'z' => 44, _ => return None,
+                        b'a' => 30,
+                        b'b' => 48,
+                        b'c' => 46,
+                        b'd' => 32,
+                        b'e' => 18,
+                        b'f' => 33,
+                        b'g' => 34,
+                        b'h' => 35,
+                        b'i' => 23,
+                        b'j' => 36,
+                        b'k' => 37,
+                        b'l' => 38,
+                        b'm' => 50,
+                        b'n' => 49,
+                        b'o' => 24,
+                        b'p' => 25,
+                        b'q' => 16,
+                        b'r' => 19,
+                        b's' => 31,
+                        b't' => 20,
+                        b'u' => 22,
+                        b'v' => 47,
+                        b'w' => 17,
+                        b'x' => 45,
+                        b'y' => 21,
+                        b'z' => 44,
+                        _ => return None,
                     };
                     return Some((0x41 + (c - b'a') as u16, ev));
                 }
@@ -91,7 +111,17 @@ pub fn is_modifier(name: &str) -> bool {
 pub fn is_extended(name: &str) -> bool {
     matches!(
         name,
-        "insert" | "delete" | "home" | "end" | "pageup" | "pagedown" | "left" | "up" | "right" | "down" | "meta"
+        "insert"
+            | "delete"
+            | "home"
+            | "end"
+            | "pageup"
+            | "pagedown"
+            | "left"
+            | "up"
+            | "right"
+            | "down"
+            | "meta"
     )
 }
 
@@ -214,7 +244,8 @@ impl Button {
 fn valid_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 32
-        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
 /// Validate one profile file (spec 11 table). Cross-profile rules
@@ -365,11 +396,13 @@ pub fn plan_key_press(keys: &[String], hold: bool, release: bool) -> Vec<(String
     // non-modifier, so everything before it is a modifier.
     let main = keys.last().cloned().unwrap_or_default();
     if release {
-        let mut seq: Vec<(String, bool)> = mods.iter().rev().map(|m| ((*m).clone(), false)).collect();
-        if !is_modifier(&main) || !mods.iter().any(|m| *m == &main) {
-            if !main.is_empty() && !mods.contains(&&main) {
-                seq.push((main, false));
-            }
+        let mut seq: Vec<(String, bool)> =
+            mods.iter().rev().map(|m| ((*m).clone(), false)).collect();
+        if (!is_modifier(&main) || !mods.contains(&&main))
+            && !main.is_empty()
+            && !mods.contains(&&main)
+        {
+            seq.push((main, false));
         }
         return seq;
     }
@@ -404,7 +437,16 @@ mod tests {
 
     #[test]
     fn key_parser_vectors() {
-        for good in ["ctrl+z", "ctrl+shift+z", "space", "shift", "b", "ctrl+equal", "f12", "meta+tab"] {
+        for good in [
+            "ctrl+z",
+            "ctrl+shift+z",
+            "space",
+            "shift",
+            "b",
+            "ctrl+equal",
+            "f12",
+            "meta+tab",
+        ] {
             assert!(parse_keys(good).is_ok(), "{good}");
         }
         for bad in ["ctrl+foo", "z+ctrl", "ctrl++z", "", "plus"] {
@@ -456,12 +498,16 @@ mod tests {
         if let Action::Key(k) = &mut badkeys.buttons[0].action {
             k.keys = "ctrl+bogus".into();
         }
-        assert!(validate_profile(&badkeys).iter().any(|e| e.contains("bad keys")));
+        assert!(validate_profile(&badkeys)
+            .iter()
+            .any(|e| e.contains("bad keys")));
         let mut holdmacro = good_profile();
         holdmacro.buttons[1].action = Action::Macro(MacroAction {
             steps: vec![MacroStep::Keys { keys: "a".into() }],
         });
-        assert!(validate_profile(&holdmacro).iter().any(|e| e.contains("macro not allowed")));
+        assert!(validate_profile(&holdmacro)
+            .iter()
+            .any(|e| e.contains("macro not allowed")));
     }
 
     #[test]
@@ -469,7 +515,11 @@ mod tests {
         for file in ["../profiles/default.json", "../profiles/krita.json"] {
             let text = std::fs::read_to_string(file).expect("profile file");
             let p: Profile = serde_json::from_str(&text).expect("profile parses");
-            assert!(validate_profile(&p).is_empty(), "{file}: {:?}", validate_profile(&p));
+            assert!(
+                validate_profile(&p).is_empty(),
+                "{file}: {:?}",
+                validate_profile(&p)
+            );
         }
     }
 
@@ -484,9 +534,17 @@ mod tests {
         .unwrap();
         let krita = good_profile();
         let set = vec![gen, krita];
-        assert_eq!(select_profile(&set, Some("KRITA.EXE"), None).unwrap().id, "krita");
+        assert_eq!(
+            select_profile(&set, Some("KRITA.EXE"), None).unwrap().id,
+            "krita"
+        );
         assert_eq!(select_profile(&set, Some("nope"), None).unwrap().id, "gen");
-        assert_eq!(select_profile(&set, Some("krita.exe"), Some("gen")).unwrap().id, "gen");
+        assert_eq!(
+            select_profile(&set, Some("krita.exe"), Some("gen"))
+                .unwrap()
+                .id,
+            "gen"
+        );
         let tap = plan_key_press(&["ctrl".into(), "z".into()], false, false);
         assert_eq!(
             tap,

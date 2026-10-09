@@ -54,7 +54,11 @@ pub fn parse_qr_uri(uri: &str) -> Result<QrPairing, &'static str> {
     if v != Some("1") {
         return Err("bad QR version");
     }
-    let hosts: Vec<String> = h.ok_or("missing h")?.split(',').map(str::to_string).collect();
+    let hosts: Vec<String> = h
+        .ok_or("missing h")?
+        .split(',')
+        .map(str::to_string)
+        .collect();
     if hosts.is_empty() || hosts.iter().any(|x| x.is_empty()) {
         return Err("bad hosts");
     }

@@ -106,19 +106,18 @@ fn load_or_generate_in(dir: &Path, hostname: &str) -> Result<Identity, String> {
     let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .map_err(|e| format!("keygen: {e}"))?;
     let mut params = rcgen::CertificateParams::default();
-    params.distinguished_name.push(
-        rcgen::DnType::CommonName,
-        format!("chiz-{hostname}"),
-    );
     params
-        .subject_alt_names
-        .push(rcgen::SanType::DnsName(
-            rcgen::string::Ia5String::try_from(hostname).map_err(|e| format!("san: {e}"))?,
-        ));
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, format!("chiz-{hostname}"));
+    params.subject_alt_names.push(rcgen::SanType::DnsName(
+        rcgen::string::Ia5String::try_from(hostname).map_err(|e| format!("san: {e}"))?,
+    ));
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now - time::Duration::days(1);
     params.not_after = now + time::Duration::days(365 * 10); // 10 years (spec 3)
-    let cert = params.self_signed(&key_pair).map_err(|e| format!("sign: {e}"))?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| format!("sign: {e}"))?;
     let cert_der = cert.der().to_vec();
     let key_der = key_pair.serialize_der();
     std::fs::write(&cert_path, &cert_der).map_err(|e| format!("cert write: {e}"))?;
@@ -172,7 +171,7 @@ mod tests {
         let d = tmpdir("reload");
         let a = load_or_generate_in(&d, "testhost").unwrap();
         assert_eq!(&a.cert_der[..2], &[0x30, 0x82]); // DER SEQUENCE
-        // CN is stored as a DER string: the hostname bytes appear verbatim.
+                                                     // CN is stored as a DER string: the hostname bytes appear verbatim.
         assert!(String::from_utf8_lossy(&a.cert_der).contains("chiz-testhost"));
         let b = load_or_generate_in(&d, "testhost").unwrap();
         assert_eq!(a.cert_der, b.cert_der); // stable across restarts
@@ -180,7 +179,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(d.join("key.bin")).unwrap().permissions().mode();
+            let mode = std::fs::metadata(d.join("key.bin"))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
     }
@@ -233,13 +235,19 @@ mod tests {
         }
     }
 
-    fn pinning_client(fp: [u8; 32], versions: Vec<&'static rustls::SupportedProtocolVersion>) -> tokio_rustls::TlsConnector {
+    fn pinning_client(
+        fp: [u8; 32],
+        versions: Vec<&'static rustls::SupportedProtocolVersion>,
+    ) -> tokio_rustls::TlsConnector {
         let provider = rustls::crypto::ring::default_provider();
         let cfg = rustls::ClientConfig::builder_with_provider(provider.clone().into())
             .with_protocol_versions(&versions)
             .unwrap()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinVerifier { fp, provider: Arc::new(provider) }))
+            .with_custom_certificate_verifier(Arc::new(PinVerifier {
+                fp,
+                provider: Arc::new(provider),
+            }))
             .with_no_client_auth();
         tokio_rustls::TlsConnector::from(Arc::new(cfg))
     }
@@ -250,16 +258,26 @@ mod tests {
         let d = tmpdir(&format!("hs-{}", versions.len()));
         let id = load_or_generate_in(&d, "hs-host").map_err(|e| e.to_string())?;
         let fp = id.fingerprint;
-        let acceptor = tokio_rustls::TlsAcceptor::from(server_config(&id).map_err(|e| e.to_string())?);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
+        let acceptor =
+            tokio_rustls::TlsAcceptor::from(server_config(&id).map_err(|e| e.to_string())?);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.map_err(|e| e.to_string())?;
-            let tls = acceptor.accept(tcp).await.map_err(|e| format!("server hs: {e}"))?;
+            let tls = acceptor
+                .accept(tcp)
+                .await
+                .map_err(|e| format!("server hs: {e}"))?;
             Ok::<_, String>(tls.get_ref().1.protocol_version().expect("negotiated"))
         });
-        let tcp = tokio::net::TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
-        let name = rustls::pki_types::ServerName::IpAddress(rustls::pki_types::IpAddr::from(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .map_err(|e| e.to_string())?;
+        let name = rustls::pki_types::ServerName::IpAddress(rustls::pki_types::IpAddr::from(
+            std::net::Ipv4Addr::new(127, 0, 0, 1),
+        ));
         let tls = pinning_client(fp, versions)
             .connect(name, tcp)
             .await
@@ -286,16 +304,22 @@ mod tests {
     #[tokio::test]
     async fn wrong_fingerprint_is_refused() {
         let d = tmpdir("wrongfp");
-        let id = load_or_generate_in(&d, "fp-host").map_err(|s| s).unwrap();
+        let id = load_or_generate_in(&d, "fp-host").unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(server_config(&id).unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            acceptor.accept(tcp).await.map(|_| ()).map_err(|e| e.to_string())
+            acceptor
+                .accept(tcp)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         });
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let name = rustls::pki_types::ServerName::IpAddress(rustls::pki_types::IpAddr::from(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+        let name = rustls::pki_types::ServerName::IpAddress(rustls::pki_types::IpAddr::from(
+            std::net::Ipv4Addr::new(127, 0, 0, 1),
+        ));
         // Attacker's cert fingerprint, not the server's.
         let r = pinning_client([0xabu8; 32], vec![&rustls::version::TLS13])
             .connect(name, tcp)

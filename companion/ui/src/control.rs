@@ -117,7 +117,10 @@ impl SessionTable {
     }
 
     pub fn session_of(&self, conn: u64) -> Option<u32> {
-        self.live.values().find(|(_, c)| *c == conn).map(|(s, _)| *s)
+        self.live
+            .values()
+            .find(|(_, c)| *c == conn)
+            .map(|(s, _)| *s)
     }
 
     #[allow(dead_code)]
@@ -151,7 +154,10 @@ pub struct AuthTracker {
 
 impl AuthTracker {
     pub fn is_blocked(&self, ip: &IpAddr, now: f64) -> bool {
-        self.blocked_until.get(ip).map(|u| now < *u).unwrap_or(false)
+        self.blocked_until
+            .get(ip)
+            .map(|u| now < *u)
+            .unwrap_or(false)
     }
 
     /// Record a failure; returns true if the IP just became blocked.

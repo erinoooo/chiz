@@ -1,14 +1,11 @@
 //! Companion screens (spec 8): Status / Mapping / Pressure / Profiles /
-//! Tablets / Settings, rendered with egui. The `eframe` runner (display
-//! server) lands in M7; this module is the complete screen state +
-//! rendering, compile-checked here, with pure helpers unit-tested.
+//! Tablets / Settings, rendered with egui by `gui.rs`; pure helpers are
+//! unit-tested.
 //!
-//! Areas per spec: tray menu lives in `tray.rs`; status shows tablet name,
-//! RTT, drop counters, live pen values; mapping has monitor picker, area
-//! editor (numbers + drag box), keep-aspect + rotation, and a test box;
-//! pressure has curve editor + presets + live meter; profiles has the list
-//! + editor with full validation; tablets has Forget + QR/PIN/countdown;
-//! settings has ports, login, log level, panic hotkey.
+//! Pages: status (connection, profile, live pen), mapping (area preview),
+//! pressure (curve plot), profiles, tablets (pairing QR/PIN), settings.
+
+use super::theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum Screen {
@@ -28,9 +25,7 @@ pub struct LivePen {
     pub pressure: f64,
     pub tilt_x: i8,
     pub tilt_y: i8,
-    pub distance: f64,
     pub tool: String,
-    pub barrel: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -38,8 +33,8 @@ pub struct StatusView {
     pub tablet_name: String,
     pub connected: bool,
     pub reconnecting: bool,
-    pub rtt_ms: f64,
-    pub companion_us: f64,
+    pub profile: String,
+    pub app: String,
     pub dropped: u64,
     pub pen: LivePen,
     pub paused: bool,
@@ -88,6 +83,7 @@ impl MappingView {
         }
     }
 
+    #[cfg(test)]
     pub fn cycle_rotation(&mut self) {
         self.rotation = match self.rotation {
             0 => 90,
@@ -131,8 +127,6 @@ impl PressureView {
 pub struct ProfilesView {
     pub ids: Vec<String>,
     pub selected: Option<String>,
-    pub editor_text: String,
-    pub editor_error: String,
 }
 
 #[derive(Clone, Default)]
@@ -148,8 +142,6 @@ pub struct TabletsView {
 pub struct SettingsView {
     pub control_port: u16,
     pub pen_port: u16,
-    pub start_at_login: bool,
-    pub log_level: String,
     pub panic_hotkey: String,
     pub wayland_note: bool,
 }
@@ -159,8 +151,6 @@ impl Default for SettingsView {
         Self {
             control_port: 47800,
             pen_port: 47801,
-            start_at_login: false,
-            log_level: "info".into(),
             panic_hotkey: chiz_core::failsafe::DEFAULT_PANIC_HOTKEY.into(),
             wayland_note: false,
         }
@@ -192,117 +182,338 @@ pub struct CompanionApp {
 
 impl CompanionApp {
     pub fn show(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("nav").show(ctx, |ui| {
-            ui.heading("Chiz");
-            for (label, s) in [
-                ("Status", Screen::Status),
-                ("Mapping", Screen::Mapping),
-                ("Pressure", Screen::Pressure),
-                ("Profiles", Screen::Profiles),
-                ("Tablets", Screen::Tablets),
-                ("Settings", Screen::Settings),
-            ] {
-                if ui.selectable_label(self.screen == s, label).clicked() {
-                    self.screen = s;
-                }
-            }
-        });
-        egui::CentralPanel::default().show(ctx, |ui| match self.screen {
-            Screen::Status => self.status_ui(ui),
-            Screen::Mapping => self.mapping_ui(ui),
-            Screen::Pressure => self.pressure_ui(ui),
-            Screen::Profiles => self.profiles_ui(ui),
-            Screen::Tablets => self.tablets_ui(ui),
-            Screen::Settings => self.settings_ui(ui),
-        });
+        egui::SidePanel::left("nav")
+            .exact_width(210.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::SIDEBAR)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                    .inner_margin(egui::Margin::symmetric(14, 18)),
+            )
+            .show(ctx, |ui| self.nav_ui(ui));
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin {
+                        left: 28,
+                        right: 28,
+                        top: 18,
+                        bottom: 18,
+                    }),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_max_width(ui.available_width().min(860.0));
+                        match self.screen {
+                            Screen::Status => self.status_ui(ui),
+                            Screen::Mapping => self.mapping_ui(ui),
+                            Screen::Pressure => self.pressure_ui(ui),
+                            Screen::Profiles => self.profiles_ui(ui),
+                            Screen::Tablets => self.tablets_ui(ui),
+                            Screen::Settings => self.settings_ui(ui),
+                        }
+                    });
+            });
     }
 
     fn act(&mut self, a: PendingAction) {
         self.pending.push(a);
     }
 
-    fn status_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Status");
-        let dot = if self.status.connected {
-            egui::Color32::GREEN
-        } else if self.status.reconnecting {
-            egui::Color32::YELLOW
-        } else {
-            egui::Color32::RED
-        };
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("●").color(dot));
-            ui.label(if self.status.tablet_name.is_empty() {
-                "no tablet".to_string()
-            } else {
-                self.status.tablet_name.clone()
-            });
-        });
-        egui::Grid::new("status").show(ui, |ui| {
-            ui.label("Round-trip");
-            ui.label(format!("{:.1} ms", self.status.rtt_ms));
-            ui.end_row();
-            ui.label("Companion processing");
-            ui.label(format!("{:.2} ms", self.status.companion_us / 1000.0));
-            ui.end_row();
-            ui.label("Dropped datagrams");
-            ui.label(self.status.dropped.to_string());
-            ui.end_row();
-            let p = &self.status.pen;
-            ui.label("Pen");
-            ui.label(format!(
-                "x={:.3} y={:.3} p={:.3} tilt={}/{} d={:.2} {} {}",
-                p.x, p.y, p.pressure, p.tilt_x, p.tilt_y, p.distance, p.tool, p.barrel
-            ));
-            ui.end_row();
-        });
+    fn connection_color(&self) -> egui::Color32 {
         if self.status.paused {
-            ui.label(egui::RichText::new("Pen input paused. Buttons keep working.").strong());
-        }
-        ui.horizontal(|ui| {
-            if ui.button("Emergency release").clicked() {
-                self.act(PendingAction::Panic);
-            }
-            let pause_label = if self.status.paused { "Resume pen input" } else { "Pause pen input" };
-            if ui.button(pause_label).clicked() {
-                self.act(PendingAction::PauseToggle);
-            }
-        });
-        if !self.status.banner.is_empty() {
-            ui.label(egui::RichText::new(&self.status.banner).color(egui::Color32::YELLOW));
+            theme::AMBER
+        } else if self.status.connected {
+            theme::GO
+        } else if self.status.reconnecting {
+            theme::AMBER
+        } else {
+            theme::TEXT_DIM
         }
     }
 
-    fn mapping_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Mapping");
-        if self.mapping.monitors.is_empty() {
-            ui.label("No monitors enumerated yet.");
-        } else {
-            egui::ComboBox::from_label("Monitor")
-                .selected_text(self.mapping.monitors[self.mapping.monitor_idx].clone())
-                .show_ui(ui, |ui| {
-                    for (i, m) in self.mapping.monitors.iter().enumerate() {
-                        ui.selectable_value(&mut self.mapping.monitor_idx, i, m);
-                    }
-                });
-        }
+    fn nav_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            for (i, name) in ["x", "y", "w", "h"].iter().enumerate() {
-                ui.label(*name);
-                ui.add(egui::DragValue::new(&mut self.mapping.area[i]).speed(0.01));
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(
+                egui::RichText::new("Chiz")
+                    .size(28.0)
+                    .strong()
+                    .color(theme::AMBER),
+            );
+            ui.label(egui::RichText::new("çiz").color(theme::TEXT_DIM));
+        });
+        ui.label(theme::dim("pen tablet for your PC").size(12.5));
+        ui.add_space(18.0);
+        for (label, s) in [
+            ("Status", Screen::Status),
+            ("Mapping", Screen::Mapping),
+            ("Pressure", Screen::Pressure),
+            ("Profiles", Screen::Profiles),
+            ("Tablets", Screen::Tablets),
+            ("Settings", Screen::Settings),
+        ] {
+            let active = self.screen == s;
+            let (rect, resp) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::click());
+            let hover = resp.hovered();
+            if active || hover {
+                ui.painter().rect_filled(
+                    rect,
+                    egui::CornerRadius::same(10),
+                    if active {
+                        theme::AMBER.gamma_multiply(0.14)
+                    } else {
+                        theme::SURFACE_HI
+                    },
+                );
+            }
+            if active {
+                let bar = egui::Rect::from_min_size(
+                    rect.left_center() - egui::vec2(0.0, 11.0),
+                    egui::vec2(3.0, 22.0),
+                );
+                ui.painter()
+                    .rect_filled(bar, egui::CornerRadius::same(2), theme::AMBER);
+            }
+            ui.painter().text(
+                rect.left_center() + egui::vec2(16.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::proportional(15.5),
+                if active { theme::AMBER } else { theme::TEXT },
+            );
+            if resp.clicked() {
+                self.screen = s;
+            }
+        }
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            let (c, t) = self.connection_summary();
+            theme::status_pill(ui, c, &t);
+        });
+    }
+
+    fn connection_summary(&self) -> (egui::Color32, String) {
+        let c = self.connection_color();
+        let t = if self.status.paused {
+            "Pen paused".to_string()
+        } else if self.status.connected {
+            "Tablet connected".to_string()
+        } else {
+            "Waiting for tablet".to_string()
+        };
+        (c, t)
+    }
+
+    fn status_ui(&mut self, ui: &mut egui::Ui) {
+        theme::title(ui, "Status", "Live view of your tablet connection.");
+        if !self.status.banner.is_empty() {
+            theme::alert_card(ui, theme::AMBER, &self.status.banner.clone());
+        }
+        theme::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (c, summary) = self.connection_summary();
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(46.0, 46.0), egui::Sense::hover());
+                let p = ui.painter();
+                p.circle_filled(rect.center(), 23.0, c.gamma_multiply(0.16));
+                p.circle_filled(rect.center(), 8.0, c);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let headline = if self.status.connected {
+                        self.status.tablet_name.clone()
+                    } else {
+                        "No tablet connected".to_string()
+                    };
+                    ui.label(egui::RichText::new(headline).size(20.0).strong());
+                    ui.label(theme::dim(if self.status.connected {
+                        summary
+                    } else {
+                        "Open the Chiz app on your tablet. Pair it first from the Tablets page."
+                            .to_string()
+                    }));
+                });
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if theme::danger_button(ui, "Emergency release").clicked() {
+                    self.act(PendingAction::Panic);
+                }
+                let label = if self.status.paused {
+                    "Resume pen"
+                } else {
+                    "Pause pen"
+                };
+                let clicked = if self.status.paused {
+                    theme::primary_button(ui, label).clicked()
+                } else {
+                    ui.button(label).clicked()
+                };
+                if clicked {
+                    self.act(PendingAction::PauseToggle);
+                }
+            });
+        });
+        ui.columns(3, |cols| {
+            for (col, (label, value, unit)) in cols.iter_mut().zip([
+                ("PROFILE", self.status.profile.clone(), ""),
+                (
+                    "ACTIVE APP",
+                    if self.status.app.is_empty() {
+                        "-".to_string()
+                    } else {
+                        self.status.app.clone()
+                    },
+                    "",
+                ),
+                ("DROPPED", self.status.dropped.to_string(), "packets"),
+            ]) {
+                theme::card(col, |ui| theme::stat(ui, label, &value, unit));
             }
         });
-        self.mapping.clamp_area();
-        ui.checkbox(&mut self.mapping.keep_aspect, "Lock aspect (circles stay circles)");
-        if ui.button(format!("Rotation: {}°", self.mapping.rotation)).clicked() {
-            self.mapping.cycle_rotation();
-        }
-        // Test box: where the cursor lands for the probe point.
-        ui.label("Test: drag the probe, see the mapped pixel.");
-        ui.horizontal(|ui| {
-            ui.add(egui::Slider::new(&mut self.mapping.test_xy.0, 0.0..=1.0).text("u"));
-            ui.add(egui::Slider::new(&mut self.mapping.test_xy.1, 0.0..=1.0).text("v"));
+        theme::card(ui, |ui| {
+            theme::section(ui, "Live pen");
+            let p = &self.status.pen;
+            theme::meter(ui, p.pressure as f32, theme::AMBER, "Pressure");
+            ui.horizontal_wrapped(|ui| {
+                for (k, v) in [
+                    ("Tilt", format!("{}° / {}°", p.tilt_x, p.tilt_y)),
+                    (
+                        "Tool",
+                        if p.tool.is_empty() {
+                            "-".into()
+                        } else {
+                            p.tool.clone()
+                        },
+                    ),
+                    ("Position", format!("{:.3}, {:.3}", p.x, p.y)),
+                ] {
+                    ui.label(theme::dim(k));
+                    ui.label(egui::RichText::new(v).monospace());
+                    ui.add_space(14.0);
+                }
+            });
         });
+    }
+
+    fn mapping_ui(&mut self, ui: &mut egui::Ui) {
+        theme::title(
+            ui,
+            "Mapping",
+            "Choose which part of the screen the tablet covers.",
+        );
+        theme::card(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(300.0);
+                    if !self.mapping.monitors.is_empty() {
+                        theme::section(ui, "Monitor");
+                        let idx = self
+                            .mapping
+                            .monitor_idx
+                            .min(self.mapping.monitors.len() - 1);
+                        egui::ComboBox::from_id_salt("monitor")
+                            .selected_text(self.mapping.monitors[idx].clone())
+                            .show_ui(ui, |ui| {
+                                for (i, m) in self.mapping.monitors.iter().enumerate() {
+                                    ui.selectable_value(&mut self.mapping.monitor_idx, i, m);
+                                }
+                            });
+                    }
+                    theme::section(ui, "Active area");
+                    egui::Grid::new("area").num_columns(2).show(ui, |ui| {
+                        for (i, name) in ["Left", "Top", "Width", "Height"].iter().enumerate() {
+                            ui.label(theme::dim(*name));
+                            ui.add(
+                                egui::DragValue::new(&mut self.mapping.area[i])
+                                    .speed(0.005)
+                                    .range(0.0..=1.0)
+                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                    .custom_parser(|s| {
+                                        s.trim_end_matches('%')
+                                            .parse::<f64>()
+                                            .ok()
+                                            .map(|v| v / 100.0)
+                                    }),
+                            );
+                            ui.end_row();
+                        }
+                    });
+                    self.mapping.clamp_area();
+                    ui.checkbox(
+                        &mut self.mapping.keep_aspect,
+                        "Keep aspect (circles stay circles)",
+                    );
+                    theme::section(ui, "Rotation");
+                    ui.horizontal(|ui| {
+                        for deg in [0u16, 90, 180, 270] {
+                            if theme::chip(ui, self.mapping.rotation == deg, &format!("{deg}°"))
+                                .clicked()
+                            {
+                                self.mapping.rotation = deg;
+                            }
+                        }
+                    });
+                    if ui.button("Reset to full screen").clicked() {
+                        self.mapping.area = [0.0, 0.0, 1.0, 1.0];
+                    }
+                });
+                ui.add_space(12.0);
+                ui.vertical(|ui| self.mapping_preview(ui));
+            });
+        });
+    }
+
+    /// Miniature monitor with the active area and a draggable test probe.
+    fn mapping_preview(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Preview");
+        let w = ui.available_width().clamp(240.0, 420.0);
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(w, w * 9.0 / 16.0), egui::Sense::click_and_drag());
+        let p = ui.painter();
+        p.rect_filled(
+            rect,
+            egui::CornerRadius::same(8),
+            egui::Color32::from_rgb(8, 8, 11),
+        );
+        p.rect_stroke(
+            rect,
+            egui::CornerRadius::same(8),
+            egui::Stroke::new(2.0_f32, theme::BORDER),
+            egui::StrokeKind::Inside,
+        );
+        let a = self.mapping.area;
+        let area = egui::Rect::from_min_size(
+            rect.min + egui::vec2(a[0] as f32 * rect.width(), a[1] as f32 * rect.height()),
+            egui::vec2(a[2] as f32 * rect.width(), a[3] as f32 * rect.height()),
+        );
+        p.rect_filled(
+            area,
+            egui::CornerRadius::same(4),
+            theme::AMBER.gamma_multiply(0.18),
+        );
+        p.rect_stroke(
+            area,
+            egui::CornerRadius::same(4),
+            egui::Stroke::new(1.5_f32, theme::AMBER),
+            egui::StrokeKind::Inside,
+        );
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let u = ((pos.x - area.min.x) / area.width().max(1.0)).clamp(0.0, 1.0);
+            let v = ((pos.y - area.min.y) / area.height().max(1.0)).clamp(0.0, 1.0);
+            self.mapping.test_xy = (u as f64, v as f64);
+        }
+        let probe = egui::pos2(
+            area.min.x + self.mapping.test_xy.0 as f32 * area.width(),
+            area.min.y + self.mapping.test_xy.1 as f32 * area.height(),
+        );
+        ui.painter().circle_filled(probe, 6.0, theme::TEAL);
+        ui.painter()
+            .circle_stroke(probe, 10.0, egui::Stroke::new(1.0_f32, theme::TEAL));
         let (px, py) = chiz_core::map_pen_to_px(
             self.mapping.test_xy.0,
             self.mapping.test_xy.1,
@@ -321,114 +532,291 @@ impl CompanionApp {
             self.mapping.keep_aspect,
             self.mapping.rotation,
         );
-        ui.label(format!("lands at {px}, {py}"));
+        ui.label(theme::dim(format!(
+            "Click inside the area to test. Probe lands at {px}, {py}"
+        )));
     }
 
     fn pressure_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Pressure");
-        ui.horizontal(|ui| {
-            for name in ["linear", "soft", "firm"] {
-                if ui.button(name).clicked() {
-                    self.pressure.preset(name);
-                }
-            }
+        theme::title(
+            ui,
+            "Pressure",
+            "Shape how hard you press into how thick the line gets.",
+        );
+        theme::card(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                self.curve_plot(ui);
+                ui.add_space(14.0);
+                ui.vertical(|ui| {
+                    theme::section(ui, "Presets");
+                    ui.horizontal(|ui| {
+                        for (name, label) in
+                            [("linear", "Linear"), ("soft", "Soft"), ("firm", "Firm")]
+                        {
+                            let mut probe = PressureView::default();
+                            probe.preset(name);
+                            let on = probe
+                                .curve
+                                .iter()
+                                .zip(self.pressure.curve.iter())
+                                .all(|(a, b)| (a - b).abs() < 1e-6);
+                            if theme::chip(ui, on, label).clicked() {
+                                self.pressure.preset(name);
+                            }
+                        }
+                    });
+                    theme::section(ui, "Curve handles");
+                    for (i, name) in ["Handle 1 x", "Handle 1 y", "Handle 2 x", "Handle 2 y"]
+                        .iter()
+                        .enumerate()
+                    {
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                egui::vec2(80.0, 20.0),
+                                egui::Label::new(theme::dim(*name)),
+                            );
+                            ui.add(egui::Slider::new(&mut self.pressure.curve[i], 0.0..=1.0));
+                        });
+                    }
+                });
+            });
         });
-        ui.horizontal(|ui| {
-            for (i, name) in ["x1", "y1", "x2", "y2"].iter().enumerate() {
-                ui.label(*name);
-                ui.add(egui::Slider::new(&mut self.pressure.curve[i], 0.0..=1.0));
-            }
+        theme::card(ui, |ui| {
+            theme::section(ui, "Live test");
+            theme::meter(ui, self.pressure.live_raw as f32, theme::TEXT_DIM, "Raw");
+            theme::meter(
+                ui,
+                self.pressure.live_mapped() as f32,
+                theme::AMBER,
+                "Output",
+            );
+            ui.label(theme::dim("Press on the tablet to see the curve respond."));
         });
-        ui.add(egui::ProgressBar::new(self.pressure.live_raw as f32).text("raw"));
-        ui.add(egui::ProgressBar::new(self.pressure.live_mapped() as f32).text("mapped"));
+    }
+
+    /// Cubic-bezier pressure curve with the live operating point.
+    fn curve_plot(&self, ui: &mut egui::Ui) {
+        let side = 230.0;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+        let p = ui.painter();
+        p.rect_filled(
+            rect,
+            egui::CornerRadius::same(10),
+            egui::Color32::from_rgb(10, 10, 13),
+        );
+        for i in 1..4 {
+            let t = i as f32 / 4.0;
+            let g = egui::Stroke::new(1.0_f32, theme::BORDER.gamma_multiply(0.6));
+            p.line_segment(
+                [
+                    egui::pos2(rect.min.x + t * side, rect.min.y),
+                    egui::pos2(rect.min.x + t * side, rect.max.y),
+                ],
+                g,
+            );
+            p.line_segment(
+                [
+                    egui::pos2(rect.min.x, rect.min.y + t * side),
+                    egui::pos2(rect.max.x, rect.min.y + t * side),
+                ],
+                g,
+            );
+        }
+        let to =
+            |x: f64, y: f64| egui::pos2(rect.min.x + x as f32 * side, rect.max.y - y as f32 * side);
+        let c = self.pressure.curve;
+        p.line_segment(
+            [to(0.0, 0.0), to(1.0, 1.0)],
+            egui::Stroke::new(1.0_f32, theme::TEXT_DIM.gamma_multiply(0.5)),
+        );
+        let pts: Vec<egui::Pos2> = (0..=64)
+            .map(|i| {
+                let t = i as f64 / 64.0;
+                let u = 1.0 - t;
+                let b = |a: f64, b1: f64, b2: f64, d: f64| {
+                    u * u * u * a + 3.0 * u * u * t * b1 + 3.0 * u * t * t * b2 + t * t * t * d
+                };
+                to(b(0.0, c[0], c[2], 1.0), b(0.0, c[1], c[3], 1.0))
+            })
+            .collect();
+        p.add(egui::Shape::line(
+            pts,
+            egui::Stroke::new(2.5_f32, theme::AMBER),
+        ));
+        p.circle_filled(to(c[0], c[1]), 4.0, theme::TEAL);
+        p.circle_filled(to(c[2], c[3]), 4.0, theme::TEAL);
+        let (lx, ly) = (self.pressure.live_raw, self.pressure.live_mapped());
+        if lx > 0.0 {
+            p.circle_filled(to(lx, ly), 5.0, egui::Color32::WHITE);
+        }
     }
 
     fn profiles_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Profiles");
-        if ui.button("Auto (follow active app)").clicked() {
-            self.act(PendingAction::ProfileLock(None));
-        }
-        ui.horizontal(|ui| {
-            for id in self.profiles.ids.clone() {
-                if ui
-                    .selectable_label(self.profiles.selected.as_deref() == Some(&id), &id)
-                    .clicked()
-                {
-                    self.profiles.selected = Some(id.clone());
-                    self.act(PendingAction::ProfileLock(Some(id)));
+        theme::title(
+            ui,
+            "Profiles",
+            "Button layouts. Auto follows the app you are drawing in.",
+        );
+        theme::card(ui, |ui| {
+            theme::section(ui, "Active profile");
+            ui.horizontal_wrapped(|ui| {
+                if theme::chip(ui, self.profiles.selected.is_none(), "Auto").clicked() {
+                    self.profiles.selected = None;
+                    self.act(PendingAction::ProfileLock(None));
                 }
+                for id in self.profiles.ids.clone() {
+                    let on = self.profiles.selected.as_deref() == Some(&id);
+                    if theme::chip(ui, on, &id).clicked() {
+                        self.profiles.selected = Some(id.clone());
+                        self.act(PendingAction::ProfileLock(Some(id)));
+                    }
+                }
+            });
+            if self.settings.wayland_note {
+                ui.label(theme::dim(
+                    "Automatic switching is unavailable on Wayland. Pick a profile here.",
+                ));
             }
         });
-        ui.label("Editor (JSON, validated on save):");
-        ui.text_edit_multiline(&mut self.profiles.editor_text);
-        if !self.profiles.editor_error.is_empty() {
-            ui.label(egui::RichText::new(&self.profiles.editor_error).color(egui::Color32::RED));
-        }
-    }
-
-    /// Validate the editor buffer with the core rules (spec 11).
-    pub fn validate_editor(&mut self) {
-        match serde_json::from_str::<chiz_core::profile::Profile>(&self.profiles.editor_text) {
-            Ok(p) => {
-                let errs = chiz_core::profile::validate_profile(&p);
-                self.profiles.editor_error = errs.join("; ");
-            }
-            Err(e) => self.profiles.editor_error = format!("JSON: {e}"),
-        }
+        theme::card(ui, |ui| {
+            theme::section(ui, "Custom layouts");
+            ui.label(theme::dim(
+                "Profiles are JSON files. Put your own in a `profiles` folder next to the Chiz \
+                 executable (copy default.json to start). Restart Chiz to load changes.",
+            ));
+        });
     }
 
     fn tablets_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Tablets");
-        ui.label("Prefer QR pairing. Use PIN pairing only on a network you trust.");
-        let paired = self.tablets.paired.clone();
-        for (id, name) in &paired {
-            ui.horizontal(|ui| {
-                ui.label(format!("{name} ({id})"));
-                if ui.button("Forget").clicked() {
-                    self.act(PendingAction::ForgetTablet(id.clone()));
-                }
+        theme::title(ui, "Tablets", "Pair once, then it reconnects by itself.");
+        if self.tablets.pairing_open {
+            theme::card(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    if let Some(tex) = &self.tablets.qr_tex {
+                        egui::Frame::new()
+                            .fill(egui::Color32::WHITE)
+                            .corner_radius(egui::CornerRadius::same(12))
+                            .inner_margin(egui::Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Image::new(tex)
+                                        .fit_to_exact_size(egui::vec2(220.0, 220.0)),
+                                );
+                            });
+                    }
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Scan with the Chiz app")
+                                .size(20.0)
+                                .strong(),
+                        );
+                        ui.label(theme::dim(
+                            "Or type this PIN on the tablet (trusted networks only):",
+                        ));
+                        let pin = if self.tablets.pin.len() == 8 {
+                            format!("{} {}", &self.tablets.pin[..4], &self.tablets.pin[4..])
+                        } else {
+                            self.tablets.pin.clone()
+                        };
+                        ui.label(
+                            egui::RichText::new(pin)
+                                .monospace()
+                                .size(34.0)
+                                .strong()
+                                .color(theme::AMBER),
+                        );
+                        ui.add(
+                            egui::ProgressBar::new(self.tablets.countdown_s as f32 / 120.0)
+                                .fill(theme::AMBER)
+                                .text(format!("{} s left", self.tablets.countdown_s)),
+                        );
+                    });
+                });
+            });
+        } else {
+            theme::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Add a tablet").size(18.0).strong());
+                        ui.label(theme::dim(
+                            "Opens a 2-minute window with a QR code. Prefer QR over PIN.",
+                        ));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::primary_button(ui, "Pair new tablet").clicked() {
+                            self.act(PendingAction::PairOpen);
+                        }
+                    });
+                });
             });
         }
-        if self.tablets.pairing_open {
-            ui.label(format!(
-                "Pairing open: {} s left — PIN {}",
-                self.tablets.countdown_s, self.tablets.pin
-            ));
-            ui.label("Scan the QR below, or type the PIN on the tablet (trusted networks only).");
-            if let Some(tex) = &self.tablets.qr_tex {
-                ui.image(tex);
+        theme::card(ui, |ui| {
+            theme::section(ui, "Paired tablets");
+            let paired = self.tablets.paired.clone();
+            if paired.is_empty() {
+                ui.label(theme::dim("None yet."));
             }
-        } else if ui.button("Pair new tablet").clicked() {
-            self.act(PendingAction::PairOpen);
-        }
+            for (id, name) in &paired {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.label(egui::RichText::new(name).strong());
+                        let short: String = id.chars().take(8).collect();
+                        ui.label(theme::dim(format!("{short}…")).small());
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button(egui::RichText::new("Forget").color(theme::DANGER))
+                            .clicked()
+                        {
+                            self.act(PendingAction::ForgetTablet(id.clone()));
+                        }
+                    });
+                });
+            }
+        });
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
-        ui.horizontal(|ui| {
-            ui.label("Control port");
-            ui.add(egui::DragValue::new(&mut self.settings.control_port));
-            ui.label("Pen port");
-            ui.add(egui::DragValue::new(&mut self.settings.pen_port));
-        });
-        ui.checkbox(&mut self.settings.start_at_login, "Start at login");
-        ui.horizontal(|ui| {
-            ui.label("Log level");
-            egui::ComboBox::from_id_salt("log")
-                .selected_text(&self.settings.log_level)
-                .show_ui(ui, |ui| {
-                    for l in ["error", "warn", "info", "debug"] {
-                        ui.selectable_value(&mut self.settings.log_level, l.to_string(), l);
-                    }
+        theme::title(ui, "Settings", "Read from config.json at startup.");
+        theme::card(ui, |ui| {
+            theme::section(ui, "Network");
+            egui::Grid::new("net")
+                .num_columns(2)
+                .spacing([24.0, 10.0])
+                .show(ui, |ui| {
+                    ui.label(theme::dim("Control port (TCP, TLS 1.3)"));
+                    ui.label(
+                        egui::RichText::new(self.settings.control_port.to_string()).monospace(),
+                    );
+                    ui.end_row();
+                    ui.label(theme::dim("Pen port (UDP, encrypted)"));
+                    ui.label(egui::RichText::new(self.settings.pen_port.to_string()).monospace());
+                    ui.end_row();
                 });
         });
-        ui.horizontal(|ui| {
-            ui.label("Panic hotkey");
-            ui.text_edit_singleline(&mut self.settings.panic_hotkey);
+        theme::card(ui, |ui| {
+            theme::section(ui, "Safety");
+            ui.horizontal(|ui| {
+                ui.label(theme::dim("Panic hotkey"));
+                ui.label(
+                    egui::RichText::new(&self.settings.panic_hotkey)
+                        .monospace()
+                        .color(theme::AMBER),
+                );
+            });
+            ui.label(theme::dim(
+                "Works from any app. Also: 3-finger tap on the tablet strip.",
+            ));
+            if self.settings.wayland_note {
+                ui.label(theme::dim(
+                    "Wayland session: the global hotkey needs X11. Use the Emergency release button.",
+                ));
+            }
         });
-        if self.settings.wayland_note {
-            ui.label("Automatic profile switching is unavailable on Wayland. Choose a profile from the tray.");
-        }
+        ui.label(theme::dim(
+            "Edit config.json (see README) and restart Chiz to change these.",
+        ));
     }
 }
 
@@ -438,8 +826,10 @@ mod tests {
 
     #[test]
     fn mapping_helpers() {
-        let mut m = MappingView::default();
-        m.area = [0.9, 0.9, 0.5, 0.5];
+        let mut m = MappingView {
+            area: [0.9, 0.9, 0.5, 0.5],
+            ..Default::default()
+        };
         m.clamp_area();
         assert!(m.area[0] + m.area[2] <= 1.0 + 1e-9);
         m.rotation = 0;
@@ -459,22 +849,5 @@ mod tests {
         assert!((p.live_mapped() - 0.7532).abs() <= 0.002);
         p.preset("linear");
         assert!((p.live_mapped() - 0.5).abs() <= 0.002);
-    }
-
-    #[test]
-    fn editor_validation_reports() {
-        let mut app = CompanionApp::default();
-        app.profiles.editor_text = "not json".into();
-        app.validate_editor();
-        assert!(app.profiles.editor_error.contains("JSON"));
-        app.profiles.editor_text = serde_json::to_string_pretty(
-            &serde_json::json!({
-                "version": 1, "id": "x", "name": "X",
-                "grid": {"cols": 1, "rows": 1}, "buttons": [],
-            }),
-        )
-        .unwrap();
-        app.validate_editor();
-        assert!(app.profiles.editor_error.is_empty());
     }
 }

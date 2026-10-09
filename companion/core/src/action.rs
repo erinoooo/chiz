@@ -25,16 +25,27 @@ pub trait Platform {
 /// Effects for the UI layer to execute in order.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
-    Key { key: String, down: bool },
-    Mouse { button: String, down: bool },
+    Key {
+        key: String,
+        down: bool,
+    },
+    Mouse {
+        button: String,
+        down: bool,
+    },
     WaitMs(u32),
     /// New toggle state to report to the tablet (`button_state`) + speak
     /// "<label> on/off" when speech is enabled.
-    ToggleState { id: String, on: bool },
+    ToggleState {
+        id: String,
+        on: bool,
+    },
     /// Eraser mode flipped (forces eraser flag on pen events while on).
     Eraser(bool),
     /// Switch profile: id, `next`, `prev`, or `auto` (unlock).
-    SwitchProfile { target: String },
+    SwitchProfile {
+        target: String,
+    },
 }
 
 /// Tracks held keys/mouse buttons, toggle states, and eraser mode.
@@ -107,7 +118,9 @@ impl ActionRunner {
                 for s in &m.steps {
                     match s {
                         MacroStep::Keys { keys } => {
-                            for (key, down) in plan_key_press(&parse_keys(keys).unwrap_or_default(), false, false) {
+                            for (key, down) in
+                                plan_key_press(&parse_keys(keys).unwrap_or_default(), false, false)
+                            {
                                 fx.push(Effect::Key { key, down });
                             }
                         }
@@ -129,13 +142,16 @@ impl ActionRunner {
                     },
                 ]
             }
-            Action::Mouse(m) => vec![Effect::Mouse {
-                button: m.button.clone(),
-                down: true,
-            }, Effect::Mouse {
-                button: m.button.clone(),
-                down: false,
-            }],
+            Action::Mouse(m) => vec![
+                Effect::Mouse {
+                    button: m.button.clone(),
+                    down: true,
+                },
+                Effect::Mouse {
+                    button: m.button.clone(),
+                    down: false,
+                },
+            ],
             Action::Profile(p) => vec![Effect::SwitchProfile {
                 target: p.target.clone(),
             }],
@@ -147,8 +163,14 @@ impl ActionRunner {
             Action::Key(k) => {
                 let keys = parse_keys(&k.keys).unwrap_or_default();
                 let seq = plan_key_press(&keys, true, false);
-                self.held_keys = seq.iter().filter(|(_, d)| *d).map(|(k, _)| k.clone()).collect();
-                seq.into_iter().map(|(key, down)| Effect::Key { key, down }).collect()
+                self.held_keys = seq
+                    .iter()
+                    .filter(|(_, d)| *d)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                seq.into_iter()
+                    .map(|(key, down)| Effect::Key { key, down })
+                    .collect()
             }
             Action::Mouse(m) => {
                 self.held_mouse.insert(m.button.clone());
@@ -173,7 +195,10 @@ impl ActionRunner {
             })
             .collect();
         for b in self.held_mouse.drain().collect::<Vec<_>>() {
-            fx.push(Effect::Mouse { button: b, down: false });
+            fx.push(Effect::Mouse {
+                button: b,
+                down: false,
+            });
         }
         self.held_keys.clear();
         fx
@@ -218,10 +243,14 @@ mod tests {
     }
 
     fn key_btn(id: &str, kind: &str, keys: &str) -> B {
-        btn(id, kind, A::Key(KeyAction {
-            keys: keys.into(),
-            keys_off: None,
-        }))
+        btn(
+            id,
+            kind,
+            A::Key(KeyAction {
+                keys: keys.into(),
+                keys_off: None,
+            }),
+        )
     }
 
     #[test]
@@ -232,10 +261,22 @@ mod tests {
         assert_eq!(
             fx,
             vec![
-                Effect::Key { key: "ctrl".into(), down: true },
-                Effect::Key { key: "z".into(), down: true },
-                Effect::Key { key: "z".into(), down: false },
-                Effect::Key { key: "ctrl".into(), down: false },
+                Effect::Key {
+                    key: "ctrl".into(),
+                    down: true
+                },
+                Effect::Key {
+                    key: "z".into(),
+                    down: true
+                },
+                Effect::Key {
+                    key: "z".into(),
+                    down: false
+                },
+                Effect::Key {
+                    key: "ctrl".into(),
+                    down: false
+                },
             ]
         );
         assert!(r.on_button(&b, "up").is_empty()); // tap up ignored
@@ -245,11 +286,29 @@ mod tests {
     fn hold_press_release_and_session_release() {
         let mut r = ActionRunner::default();
         let b = key_btn("pan", "hold", "space");
-        assert_eq!(r.on_button(&b, "down"), vec![Effect::Key { key: "space".into(), down: true }]);
-        assert_eq!(r.on_button(&b, "up"), vec![Effect::Key { key: "space".into(), down: false }]);
+        assert_eq!(
+            r.on_button(&b, "down"),
+            vec![Effect::Key {
+                key: "space".into(),
+                down: true
+            }]
+        );
+        assert_eq!(
+            r.on_button(&b, "up"),
+            vec![Effect::Key {
+                key: "space".into(),
+                down: false
+            }]
+        );
         // Held at session end -> released.
         r.on_button(&b, "down");
-        assert_eq!(r.release_all(), vec![Effect::Key { key: "space".into(), down: false }]);
+        assert_eq!(
+            r.release_all(),
+            vec![Effect::Key {
+                key: "space".into(),
+                down: false
+            }]
+        );
         assert!(r.release_all().is_empty());
     }
 
@@ -265,11 +324,23 @@ mod tests {
             }),
         );
         let on = r.on_button(&b, "down");
-        assert!(on.contains(&Effect::ToggleState { id: "brush-toggle".into(), on: true }));
-        assert!(on.contains(&Effect::Key { key: "b".into(), down: true }));
+        assert!(on.contains(&Effect::ToggleState {
+            id: "brush-toggle".into(),
+            on: true
+        }));
+        assert!(on.contains(&Effect::Key {
+            key: "b".into(),
+            down: true
+        }));
         let off = r.on_button(&b, "down");
-        assert!(off.contains(&Effect::ToggleState { id: "brush-toggle".into(), on: false }));
-        assert!(off.contains(&Effect::Key { key: "v".into(), down: true }));
+        assert!(off.contains(&Effect::ToggleState {
+            id: "brush-toggle".into(),
+            on: false
+        }));
+        assert!(off.contains(&Effect::Key {
+            key: "v".into(),
+            down: true
+        }));
     }
 
     #[test]
@@ -280,7 +351,10 @@ mod tests {
             r.on_button(&b, "down"),
             vec![
                 Effect::Eraser(true),
-                Effect::ToggleState { id: "eraser".into(), on: true }
+                Effect::ToggleState {
+                    id: "eraser".into(),
+                    on: true
+                }
             ]
         );
         assert!(r.eraser_on);
@@ -297,26 +371,54 @@ mod tests {
             "tap",
             A::Macro(MacroAction {
                 steps: vec![
-                    MacroStep::Keys { keys: "ctrl+s".into() },
+                    MacroStep::Keys {
+                        keys: "ctrl+s".into(),
+                    },
                     MacroStep::Wait { wait_ms: 100 },
                 ],
             }),
         );
         let fx = r.on_button(&b, "down");
-        assert_eq!(fx[0], Effect::Key { key: "ctrl".into(), down: true });
+        assert_eq!(
+            fx[0],
+            Effect::Key {
+                key: "ctrl".into(),
+                down: true
+            }
+        );
         assert!(fx.contains(&Effect::WaitMs(100)));
-        let click = btn("c", "tap", A::Mouse(MouseAction { button: "right".into() }));
+        let click = btn(
+            "c",
+            "tap",
+            A::Mouse(MouseAction {
+                button: "right".into(),
+            }),
+        );
         assert_eq!(
             r.on_button(&click, "down"),
             vec![
-                Effect::Mouse { button: "right".into(), down: true },
-                Effect::Mouse { button: "right".into(), down: false },
+                Effect::Mouse {
+                    button: "right".into(),
+                    down: true
+                },
+                Effect::Mouse {
+                    button: "right".into(),
+                    down: false
+                },
             ]
         );
-        let sw = btn("s", "tap", A::Profile(ProfileAction { target: "krita".into() }));
+        let sw = btn(
+            "s",
+            "tap",
+            A::Profile(ProfileAction {
+                target: "krita".into(),
+            }),
+        );
         assert_eq!(
             r.on_button(&sw, "down"),
-            vec![Effect::SwitchProfile { target: "krita".into() }]
+            vec![Effect::SwitchProfile {
+                target: "krita".into()
+            }]
         );
     }
 
@@ -336,13 +438,28 @@ mod tests {
             }
         }
         let r = ActionRunner::default();
-        let mut p = Rec { log: vec![], waits: vec![] };
-        r.execute(&mut p, &[
-            Effect::Key { key: "ctrl".into(), down: true },
-            Effect::WaitMs(50),
-            Effect::Key { key: "ctrl".into(), down: false },
-        ]);
-        assert_eq!(p.log, vec![("ctrl".to_string(), true), ("ctrl".to_string(), false)]);
+        let mut p = Rec {
+            log: vec![],
+            waits: vec![],
+        };
+        r.execute(
+            &mut p,
+            &[
+                Effect::Key {
+                    key: "ctrl".into(),
+                    down: true,
+                },
+                Effect::WaitMs(50),
+                Effect::Key {
+                    key: "ctrl".into(),
+                    down: false,
+                },
+            ],
+        );
+        assert_eq!(
+            p.log,
+            vec![("ctrl".to_string(), true), ("ctrl".to_string(), false)]
+        );
         assert_eq!(p.waits, vec![50]);
     }
 }

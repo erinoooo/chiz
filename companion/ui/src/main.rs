@@ -1,27 +1,28 @@
 //! Chiz companion runtime (spec 8, 12).
 //!
-//! What is wired here (M6-M7 start):
-//! - TCP control listener (default 47800) + UDP pen listener (47801).
+//! Runtime overview:
+//! - TLS 1.3 TCP control listener (default 47800) + UDP pen listener (47801).
 //! - Private-source gate, 4-unauth cap, 10 s handshake deadline,
 //!   5 s liveness deadline, per-IP auth backoff, single-tablet session
 //!   table with same-device replace, `release_all` hook on session end.
+//! - mDNS advertisement, egui window, global panic hotkey, and a
+//!   foreground-app watcher for automatic profile switching.
 //!
-//! TLS splice point: wrap `TcpStream` in a rustls server stream (rustls +
-//! rcgen ECDSA P-256 self-signed cert, TLS 1.3 only, pinned-fingerprint
-//! client auth via `hello`/pair proofs) BEFORE the frame loop below. The
-//! frame loop itself is transport-agnostic, which is why control.rs tests
-//! exercise it without sockets. mDNS (`_chiz._tcp`, TXT v/id/name),
-//! tray + egui screens, and QR rendering land in later slices.
+//! The frame loop is transport-agnostic, which is why control.rs tests
+//! exercise it without sockets.
+#![cfg_attr(test, allow(clippy::needless_range_loop))]
+// Release builds on Windows are GUI-subsystem: no stray console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod control;
 mod gui;
-mod inject;
 mod identity;
+mod inject;
 mod mdns;
 mod pairing;
 mod pen;
 mod screens;
-mod tray;
+mod theme;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -72,19 +73,43 @@ impl Config {
     /// Minimal loader: reads ports + public-source override from a JSON
     /// file shaped like companion/config.example.json. Unknown fields
     /// ignored; missing file -> defaults.
-    fn load(path: &str) -> Self {
+    fn load(path: &std::path::Path) -> Self {
         let mut cfg = Self::default();
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return cfg;
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return cfg,
+            Err(e) => {
+                eprintln!("cannot read {}: {e}; using defaults", path.display());
+                return cfg;
+            }
         };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-            return cfg;
+        let v = match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{} is not valid JSON ({e}); using defaults", path.display());
+                return cfg;
+            }
         };
-        if let Some(p) = v.get("ports").and_then(|p| p.get("control")).and_then(|p| p.as_u64()) {
-            cfg.control_port = p as u16;
+        eprintln!("config: {}", path.display());
+        if let Some(p) = v
+            .get("ports")
+            .and_then(|p| p.get("control"))
+            .and_then(|p| p.as_u64())
+        {
+            match u16::try_from(p).ok().filter(|p| *p != 0) {
+                Some(p) => cfg.control_port = p,
+                None => eprintln!("ports.control {p} out of range; using default"),
+            }
         }
-        if let Some(p) = v.get("ports").and_then(|p| p.get("pen")).and_then(|p| p.as_u64()) {
-            cfg.pen_port = p as u16;
+        if let Some(p) = v
+            .get("ports")
+            .and_then(|p| p.get("pen"))
+            .and_then(|p| p.as_u64())
+        {
+            match u16::try_from(p).ok().filter(|p| *p != 0) {
+                Some(p) => cfg.pen_port = p,
+                None => eprintln!("ports.pen {p} out of range; using default"),
+            }
         }
         if let Some(a) = v.get("allow_public_source").and_then(|a| a.as_bool()) {
             cfg.allow_public = a;
@@ -171,10 +196,10 @@ struct Shared {
     paired: Mutex<PairedStore>,
     fp: [u8; 32], // own cert fingerprint: binds PIN proofs, feeds QR/mDNS
     pen_key: Mutex<HashMap<u32, ([u8; 32], String)>>, // session_id -> (key, peer ip)
-    pen_rx: Mutex<HashMap<u32, PenReceiver>>,         // session_id -> receiver
-    pen_aspect: Mutex<HashMap<u32, (u32, u32)>>,       // session_id -> pen area px
+    pen_rx: Mutex<HashMap<u32, PenReceiver>>, // session_id -> receiver
+    pen_aspect: Mutex<HashMap<u32, (u32, u32)>>, // session_id -> pen area px
     injector: std::sync::Mutex<inject::Injector>,
-    mail: Mutex<HashMap<u64, VecDeque<Vec<u8>>>>,     // conn_id -> queued server frames
+    mail: Mutex<HashMap<u64, VecDeque<Vec<u8>>>>, // conn_id -> queued server frames
     profiles: Mutex<ProfileSet>,
     runner: Mutex<ActionRunner>,
     /// std mutex (not tokio): the OS panic-hook thread has no runtime and
@@ -183,8 +208,7 @@ struct Shared {
     failsafe: std::sync::Mutex<Failsafe>,
 }
 
-/// Status banner hook: tray notification + status screen in the full UI;
-/// stderr until then so it is visible in logs too.
+/// Status banner: written to stderr so it lands in logs.
 fn banner(msg: &str) {
     eprintln!("CHIZ: {msg}");
 }
@@ -199,17 +223,19 @@ static RT: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::ne
 /// touches the network or disk inline, so it works even if session tasks
 /// are wedged — and never deadlocks the GUI thread (no block_on anywhere).
 pub(crate) fn emergency_release(shared: &Arc<Shared>) {
-    let newly = shared.failsafe.lock().expect("failsafe").emergency_release();
+    let newly = shared.failsafe.lock_ok().emergency_release();
     // Release held keys even if pen was already paused: a stuck modifier
     // must never survive the panic switch.
     let sh = Arc::clone(shared);
     let release = move || {
         let rel = sh.runner.blocking_lock().release_all();
         drive_all(&sh, &rel);
-        sh.injector.lock().expect("injector").force_leave();
+        sh.injector.lock_ok().force_leave();
         release_all("panic");
         if newly {
-            banner("Emergency release: pen paused, everything released. Resume from the tray.");
+            banner(
+                "Emergency release: pen paused, everything released. Resume from the Chiz window.",
+            );
         } else {
             banner("Emergency release: everything released (pen already paused).");
         }
@@ -225,22 +251,21 @@ pub(crate) fn emergency_release(shared: &Arc<Shared>) {
     }
 }
 
-/// Tray menu wiring point (tray-icon crate, M6). Items:
-/// "Emergency release", "Pause pen input" (toggle), "Resume".
+/// GUI action dispatch: "panic", "pause", "resume".
 fn tray_action(shared: &Arc<Shared>, item: &str) {
     match item {
         "panic" => emergency_release(shared),
         "pause" => {
-            if shared.failsafe.lock().expect("failsafe").pause(PauseReason::Manual) {
+            if shared.failsafe.lock_ok().pause(PauseReason::Manual) {
                 let rel = shared.runner.blocking_lock().release_all();
                 drive_all(shared.as_ref(), &rel);
-                shared.injector.lock().expect("injector").force_leave();
+                shared.injector.lock_ok().force_leave();
                 release_all("pause");
                 banner("Pen input paused. Buttons keep working.");
             }
         }
         "resume" => {
-            shared.failsafe.lock().expect("failsafe").resume();
+            shared.failsafe.lock_ok().resume();
             banner("Pen input resumed.");
         }
         _ => {}
@@ -258,7 +283,11 @@ struct ProfileSet {
 
 impl ProfileSet {
     fn current(&self) -> Option<&Profile> {
-        profile::select_profile(&self.profiles, foreground_app().as_deref(), self.locked.as_deref())
+        profile::select_profile(
+            &self.profiles,
+            foreground_app().as_deref(),
+            self.locked.as_deref(),
+        )
     }
     fn switch(&mut self, target: &str) -> Option<(String, String)> {
         // Returns (profile_id, reason). Releases are the caller's job.
@@ -291,10 +320,117 @@ impl ProfileSet {
     }
 }
 
-/// No portable Wayland API exists: returns None, auto-switch stays off,
-/// and the UI must say so (spec 10). X11/Wayland platform crates override.
+/// Poison-tolerant locking for the std mutexes. A panic elsewhere must
+/// never turn the emergency-release path (or the pen path) into a second
+/// panic: the guarded state is plain flags/handles and stays usable.
+trait LockExt<T> {
+    fn lock_ok(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockExt<T> for std::sync::Mutex<T> {
+    fn lock_ok(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Last stable foreground app name, written by the poller thread. A plain
+/// std mutex: held for a clone, never across an await.
+static FOREGROUND: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 fn foreground_app() -> Option<String> {
-    None
+    FOREGROUND.lock_ok().clone()
+}
+
+/// Probe the OS for the focused app (blocking; poller thread only).
+/// Wayland has no portable API: returns None and auto-switch simply never
+/// fires there (manual profile lock still works).
+struct ForegroundProbe {
+    #[cfg(unix)]
+    x11: chiz_platform_linux::x11::ForegroundProbe,
+}
+
+impl ForegroundProbe {
+    fn new() -> Self {
+        Self {
+            #[cfg(unix)]
+            x11: Default::default(),
+        }
+    }
+    fn read(&mut self) -> Option<String> {
+        #[cfg(unix)]
+        {
+            self.x11.foreground_app()
+        }
+        #[cfg(windows)]
+        {
+            chiz_platform_windows::foreground_app_name()
+        }
+    }
+}
+
+/// Spec 8: poll the focused app, switch after it is stable for 300 ms.
+/// Chiz's own window never counts (clicking our GUI must not flip the
+/// strip to the default profile).
+fn spawn_foreground_poller(shared: Arc<Shared>) {
+    let own = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_lowercase()));
+    let spawned = std::thread::Builder::new()
+        .name("chiz-foreground".into())
+        .spawn(move || {
+            let mut probe = ForegroundProbe::new();
+            let (mut cand, mut seen) = (None::<String>, 0u32);
+            loop {
+                std::thread::sleep(Duration::from_millis(150));
+                let now = probe.read();
+                let is_own = now
+                    .as_deref()
+                    .map(|n| {
+                        own.as_deref()
+                            .is_some_and(|o| n.trim_end_matches(".exe") == o)
+                    })
+                    .unwrap_or(false);
+                if is_own || now == foreground_app() {
+                    cand = None;
+                    seen = 0;
+                    continue;
+                }
+                if now == cand {
+                    seen += 1;
+                } else {
+                    cand = now.clone();
+                    seen = 1;
+                }
+                if seen < 2 {
+                    continue; // ~300 ms stable
+                }
+                cand = None;
+                seen = 0;
+                let Some(rt) = RT.get() else { continue };
+                let sh = Arc::clone(&shared);
+                rt.spawn(async move { apply_foreground(&sh, now).await });
+            }
+        })
+        .is_ok();
+    if !spawned {
+        eprintln!("could not start foreground watcher; auto profile switching is off");
+    }
+}
+
+/// Commit a new foreground app; if it changes the active profile, release
+/// anything held and push the new profile to the tablet.
+async fn apply_foreground(shared: &Arc<Shared>, app: Option<String>) {
+    let changed = {
+        let ps = shared.profiles.lock().await;
+        let before = ps.current().map(|p| p.id.clone());
+        *FOREGROUND.lock_ok() = app;
+        before != ps.current().map(|p| p.id.clone())
+    };
+    if changed {
+        let rel = shared.runner.lock().await.release_all();
+        drive_all(shared.as_ref(), &rel);
+        broadcast_profile(shared, "app").await;
+    }
 }
 
 /// Load `*.json` profiles. Search order: directory next to the executable
@@ -314,9 +450,14 @@ fn load_profiles() -> ProfileSet {
         }
     }
     dirs.extend(
-        ["companion/profiles", "profiles", "./profiles", "../profiles"]
-            .iter()
-            .map(|s| s.to_string()),
+        [
+            "companion/profiles",
+            "profiles",
+            "./profiles",
+            "../profiles",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
     );
     let mut profiles = vec![];
     for dir in &dirs {
@@ -400,10 +541,12 @@ fn action_wire(a: &profile::Action) -> serde_json::Value {
             }
             v
         }
-        profile::Action::Macro(m) => serde_json::json!({"type": "macro", "steps": m.steps.iter().map(|s| match s {
+        profile::Action::Macro(m) => {
+            serde_json::json!({"type": "macro", "steps": m.steps.iter().map(|s| match s {
             profile::MacroStep::Keys { keys } => serde_json::json!({"keys": keys}),
             profile::MacroStep::Wait { wait_ms } => serde_json::json!({"wait_ms": wait_ms}),
-        }).collect::<Vec<_>>()}),
+        }).collect::<Vec<_>>()})
+        }
         profile::Action::Profile(p) => serde_json::json!({"type": "profile", "target": p.target}),
         profile::Action::EraserToggle => serde_json::json!({"type": "eraser_toggle"}),
         profile::Action::Mouse(m) => serde_json::json!({"type": "mouse", "button": m.button}),
@@ -414,7 +557,7 @@ fn action_wire(a: &profile::Action) -> serde_json::Value {
 /// Apply Key/Mouse effects to the real OS injector (SendInput/uinput).
 /// Sync: the injector lock is never held across await.
 fn drive(shared: &Shared, fx: &Effect) {
-    let mut inj = shared.injector.lock().expect("injector");
+    let mut inj = shared.injector.lock_ok();
     inj.ensure(now_secs());
     match fx {
         Effect::Key { key, down } => {
@@ -450,8 +593,8 @@ async fn handle_pen_datagram(shared: &Arc<Shared>, dg: &[u8], src: SocketAddr) {
     let key = *key;
     drop(keys);
     // Pause gate: drop decoded pen, inject `leave` once, buttons unaffected.
-    if shared.failsafe.lock().expect("failsafe").drop_pen() {
-        let mut fs = shared.failsafe.lock().expect("failsafe");
+    if shared.failsafe.lock_ok().drop_pen() {
+        let mut fs = shared.failsafe.lock_ok();
         if fs.leave_pending {
             fs.leave_pending = false;
             eprintln!("inject_pen leave (paused)");
@@ -467,9 +610,15 @@ async fn handle_pen_datagram(shared: &Arc<Shared>, dg: &[u8], src: SocketAddr) {
         return;
     }
     let eraser_forced = shared.runner.lock().await.eraser_on;
-    let aspect = shared.pen_aspect.lock().await.get(&sid).copied().unwrap_or((2100, 1600));
+    let aspect = shared
+        .pen_aspect
+        .lock()
+        .await
+        .get(&sid)
+        .copied()
+        .unwrap_or((2100, 1600));
     // Pause gate re-check is above; inject through the OS device now.
-    let mut inj = shared.injector.lock().expect("injector");
+    let mut inj = shared.injector.lock_ok();
     inj.ensure(now_secs());
     for r in recs {
         // Pipeline order (spec 8): rotate+map -> pressure curve ->
@@ -479,7 +628,7 @@ async fn handle_pen_datagram(shared: &Arc<Shared>, dg: &[u8], src: SocketAddr) {
             r.phase, r.x, r.y, r.pressure, r.distance, r.tilt_x, r.tilt_y, eraser, r.barrel1,
             r.barrel2, aspect,
         );
-        shared.failsafe.lock().expect("failsafe").note_clean_input();
+        shared.failsafe.lock_ok().note_clean_input();
     }
 }
 
@@ -498,19 +647,19 @@ async fn watchdog_tick(shared: &Arc<Shared>) {
     }
     // Inject every watchdog repair (up+leave / leave) through the device.
     {
-        let mut inj = shared.injector.lock().expect("injector");
+        let mut inj = shared.injector.lock_ok();
         inj.ensure(now_secs());
         for _ in 0..trips {
             inj.force_leave();
         }
     }
     for _ in 0..trips {
-        if shared.failsafe.lock().expect("failsafe").note_stuck_trip().is_some() {
+        if shared.failsafe.lock_ok().note_stuck_trip().is_some() {
             let rel = shared.runner.lock().await.release_all();
             drive_all(shared.as_ref(), &rel);
-            shared.injector.lock().expect("injector").force_leave();
+            shared.injector.lock_ok().force_leave();
             release_all("auto-pause");
-            banner("Pen auto-paused after repeated stuck input. Resume from the tray.");
+            banner("Pen auto-paused after repeated stuck input. Resume from the Chiz window.");
         }
     }
 }
@@ -522,7 +671,10 @@ fn release_all(reason: &str) {
     eprintln!("release_all({reason})");
 }
 
-async fn send_msg(stream: &mut (impl AsyncWriteExt + Unpin), v: &serde_json::Value) -> std::io::Result<()> {
+async fn send_msg(
+    stream: &mut (impl AsyncWriteExt + Unpin),
+    v: &serde_json::Value,
+) -> std::io::Result<()> {
     let bytes = control::encode_frame(v).expect("frame encode");
     stream.write_all(&bytes).await
 }
@@ -560,17 +712,17 @@ async fn read_msg(
     }
 }
 
-async fn handle_conn<S>(
-    mut stream: S,
-    peer: SocketAddr,
-    cfg: Config,
-    shared: Arc<Shared>,
-) where
+async fn handle_conn<S>(mut stream: S, peer: SocketAddr, cfg: Config, shared: Arc<Shared>)
+where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     let peer_ip = peer.ip();
     if !cfg.allow_public && !control::is_private_source(&peer_ip) {
-        let _ = send_msg(&mut stream, &error_msg("not_paired", "public source refused by default")).await;
+        let _ = send_msg(
+            &mut stream,
+            &error_msg("not_paired", "public source refused by default"),
+        )
+        .await;
         return;
     }
     if shared.auth.lock().await.is_blocked(&peer_ip, now_secs()) {
@@ -593,13 +745,18 @@ async fn handle_conn<S>(
     // Challenge first (fresh 16-byte nonce per connection).
     let mut nonce = [0u8; 16];
     os_random(&mut nonce);
-    let challenge_for = |nonce: &[u8; 16], pairing_open: bool| serde_json::json!({
-        "t": "challenge", "proto": 1, "nonce": base64_b64(nonce),
-        "pc_name": hostname(), "os": std::env::consts::OS,
-        "pairing_open": pairing_open,
-    });
+    let challenge_for = |nonce: &[u8; 16], pairing_open: bool| {
+        serde_json::json!({
+            "t": "challenge", "proto": 1, "nonce": base64_b64(nonce),
+            "pc_name": hostname(), "os": std::env::consts::OS,
+            "pairing_open": pairing_open,
+        })
+    };
     let pairing_now_open = shared.pairing.lock().await.is_open(now_secs());
-    if send_msg(&mut stream, &challenge_for(&nonce, pairing_now_open)).await.is_err() {
+    if send_msg(&mut stream, &challenge_for(&nonce, pairing_now_open))
+        .await
+        .is_err()
+    {
         release_unauth(&shared).await;
         return;
     }
@@ -613,33 +770,36 @@ async fn handle_conn<S>(
         if last_rx.elapsed() > Duration::from_secs_f64(control::DEAD_AFTER_SECS) {
             break; // dead connection
         }
-        let msg = match tokio::time::timeout(Duration::from_millis(200), read_msg(&mut stream, &mut buf)).await {
-            Ok(Ok(Some(v))) => v,
-            Ok(Ok(None)) => break, // EOF
-            Ok(Err(_)) => break,
-            Err(_) => {
-                // Timeout tick: re-check deadlines + pump server frames.
-                let mut pending = vec![];
-                if let Ok(mut mail) = shared.mail.try_lock() {
-                    if let Some(q) = mail.get_mut(&conn_id) {
-                        while let Some(b) = q.pop_front() {
-                            pending.push(b);
+        let msg =
+            match tokio::time::timeout(Duration::from_millis(200), read_msg(&mut stream, &mut buf))
+                .await
+            {
+                Ok(Ok(Some(v))) => v,
+                Ok(Ok(None)) => break, // EOF
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    // Timeout tick: re-check deadlines + pump server frames.
+                    let mut pending = vec![];
+                    if let Ok(mut mail) = shared.mail.try_lock() {
+                        if let Some(q) = mail.get_mut(&conn_id) {
+                            while let Some(b) = q.pop_front() {
+                                pending.push(b);
+                            }
                         }
                     }
-                }
-                let mut failed = false;
-                for b in pending {
-                    if stream.write_all(&b).await.is_err() {
-                        failed = true;
+                    let mut failed = false;
+                    for b in pending {
+                        if stream.write_all(&b).await.is_err() {
+                            failed = true;
+                            break;
+                        }
+                    }
+                    if failed {
                         break;
                     }
+                    continue;
                 }
-                if failed {
-                    break;
-                }
-                continue;
-            }
-        };
+            };
         if msg.get("t") == Some(&serde_json::Value::from("_more")) {
             continue;
         }
@@ -658,12 +818,20 @@ async fn handle_conn<S>(
                 if matches!(stage, ConnStage::Authed { .. }) {
                     continue;
                 }
-                let device_id = msg.get("device_id").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+                let device_id = msg
+                    .get("device_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
                 let mode = msg.get("mode").and_then(|v| v.as_str()).unwrap_or("");
                 let mut ps = shared.pairing.lock().await;
                 if !ps.is_open(now_secs()) {
                     drop(ps);
-                    let _ = send_msg(&mut stream, &error_msg("not_paired", "no pairing window open")).await;
+                    let _ = send_msg(
+                        &mut stream,
+                        &error_msg("not_paired", "no pairing window open"),
+                    )
+                    .await;
                     break;
                 }
                 // Own cert fingerprint binds the PIN proof (MITM fails).
@@ -681,7 +849,11 @@ async fn handle_conn<S>(
                 if ok {
                     let mut secret = [0u8; 32];
                     os_random(&mut secret);
-                    let device_name = msg.get("device_name").and_then(|v| v.as_str()).unwrap_or("tablet").to_owned();
+                    let device_name = msg
+                        .get("device_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tablet")
+                        .to_owned();
                     {
                         let mut ps = shared.paired.lock().await;
                         ps.secrets.insert(device_id.clone(), secret);
@@ -690,14 +862,18 @@ async fn handle_conn<S>(
                     drop(ps);
                     shared.pairing.lock().await.window.record_success();
                     banner(&format!("Tablet paired: {device_name}"));
-                    let reply = serde_json::json!({"t": "pair_ok", "device_secret": base64_b64(&secret)});
+                    let reply =
+                        serde_json::json!({"t": "pair_ok", "device_secret": base64_b64(&secret)});
                     if send_msg(&mut stream, &reply).await.is_err() {
                         break;
                     }
                     // Fresh challenge: the tablet now answers with `hello`.
                     os_random(&mut nonce);
                     let open = shared.pairing.lock().await.is_open(now_secs());
-                    if send_msg(&mut stream, &challenge_for(&nonce, open)).await.is_err() {
+                    if send_msg(&mut stream, &challenge_for(&nonce, open))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 } else {
@@ -725,9 +901,14 @@ async fn handle_conn<S>(
                 }
             }
             "hello" => {
-                let device_id = msg.get("device_id").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+                let device_id = msg
+                    .get("device_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
                 let auth_b64 = msg.get("auth").and_then(|v| v.as_str()).unwrap_or("");
-                let Some(secret) = shared.paired.lock().await.secrets.get(&device_id).cloned() else {
+                let Some(secret) = shared.paired.lock().await.secrets.get(&device_id).cloned()
+                else {
                     let _ = send_msg(&mut stream, &error_msg("not_paired", "unknown tablet")).await;
                     shared.auth.lock().await.record_failure(peer_ip, now_secs());
                     break;
@@ -744,8 +925,10 @@ async fn handle_conn<S>(
                         // Pen-area ratio drives mapping (spec 8); refreshed
                         // by later `surface` messages.
                         if let Some(pa) = msg.get("pen_area") {
-                            let w = pa.get("w").and_then(|v| v.as_u64()).unwrap_or(2100).max(1) as u32;
-                            let h = pa.get("h").and_then(|v| v.as_u64()).unwrap_or(1600).max(1) as u32;
+                            let w =
+                                pa.get("w").and_then(|v| v.as_u64()).unwrap_or(2100).max(1) as u32;
+                            let h =
+                                pa.get("h").and_then(|v| v.as_u64()).unwrap_or(1600).max(1) as u32;
                             shared.pen_aspect.lock().await.insert(sid, (w, h));
                         } else {
                             shared.pen_aspect.lock().await.insert(sid, (2100, 1600));
@@ -753,7 +936,11 @@ async fn handle_conn<S>(
                         let mut salt = [0u8; 16];
                         os_random(&mut salt);
                         let key = derive_pen_key(&secret, &salt);
-                        shared.pen_key.lock().await.insert(sid, (key, peer_ip.to_string()));
+                        shared
+                            .pen_key
+                            .lock()
+                            .await
+                            .insert(sid, (key, peer_ip.to_string()));
                         shared
                             .pen_rx
                             .lock()
@@ -780,7 +967,11 @@ async fn handle_conn<S>(
                         release_unauth(shared.as_ref()).await;
                     }
                     Err(_holder) => {
-                        let _ = send_msg(&mut stream, &error_msg("busy", "another tablet is connected")).await;
+                        let _ = send_msg(
+                            &mut stream,
+                            &error_msg("busy", "another tablet is connected"),
+                        )
+                        .await;
                         break;
                     }
                 }
@@ -799,9 +990,8 @@ async fn handle_conn<S>(
                 }
                 let maybe_btn = {
                     let ps = shared.profiles.lock().await;
-                    ps.current().and_then(|p| {
-                        p.buttons.iter().find(|b| b.id == id).map(|b| b.clone())
-                    })
+                    ps.current()
+                        .and_then(|p| p.buttons.iter().find(|b| b.id == id).cloned())
                 };
                 let Some(button) = maybe_btn else {
                     continue; // unknown button id: ignore
@@ -882,7 +1072,7 @@ async fn handle_conn<S>(
         shared.pen_aspect.lock().await.remove(&sid);
         let rel = shared.runner.lock().await.release_all();
         drive_all(shared.as_ref(), &rel);
-        shared.injector.lock().expect("injector").force_leave();
+        shared.injector.lock_ok().force_leave();
         release_all("session end");
     }
     shared.sessions.lock().await.remove_conn(conn_id);
@@ -985,7 +1175,7 @@ async fn broadcast_profile(shared: &Arc<Shared>, reason: &str) {
 }
 
 /// Open a pairing window: token + PIN, QR URI on stdout/log, PBM beside the
-/// identity, PIN for manual entry. GUI/tray calls this on "Pair new tablet".
+/// identity, PIN for manual entry. The GUI calls this on "Pair new tablet".
 async fn open_pairing(shared: &Arc<Shared>, fp: &[u8; 32], port: u16) {
     let (token, pin) = shared.pairing.lock().await.open(now_secs());
     let hosts = local_ipv4_hosts();
@@ -1011,6 +1201,301 @@ async fn open_pairing(shared: &Arc<Shared>, fp: &[u8; 32], port: u16) {
 async fn release_unauth(shared: &Shared) {
     let mut n = shared.unauth_count.lock().await;
     *n = n.saturating_sub(1);
+}
+
+/// Startup failures are user-facing: say what is wrong and exit non-zero
+/// instead of dumping a panic backtrace.
+fn fatal(msg: &str) -> ! {
+    eprintln!("CHIZ: fatal: {msg}");
+    std::process::exit(1);
+}
+
+/// `$CHIZ_CONFIG`, else `config.json` in the data dir, else beside the exe.
+fn config_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("CHIZ_CONFIG") {
+        return p.into();
+    }
+    let user = identity::data_dir().join("config.json");
+    if user.exists() {
+        return user;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("config.json")))
+        .unwrap_or(user)
+}
+
+async fn setup() -> Boot {
+    let cfg = Config::load(&config_path());
+    let profiles = load_profiles();
+    eprintln!(
+        "profiles: {} loaded{}",
+        profiles.profiles.len(),
+        profiles
+            .profiles
+            .iter()
+            .find(|p| p.default)
+            .map(|p| format!(" (default: {})", p.id))
+            .unwrap_or_default()
+    );
+    let me = hostname();
+    let id = identity::load_or_generate(&me)
+        .unwrap_or_else(|e| fatal(&format!("cannot load or create the TLS identity: {e}")));
+    eprintln!("identity dir: {}", identity::data_dir().display());
+    eprintln!(
+        "cert fingerprint sha256: {}",
+        identity::fp_hex(&id.fingerprint)
+    );
+    let shared = Arc::new(Shared {
+        sessions: Mutex::new(SessionTable::default()),
+        auth: Mutex::new(control::AuthTracker::default()),
+        unauth_count: Mutex::new(0),
+        pairing: Mutex::new(pairing::PairingState::closed()),
+        paired: Mutex::new(PairedStore::default()),
+        fp: id.fingerprint,
+        pen_key: Mutex::new(HashMap::new()),
+        pen_rx: Mutex::new(HashMap::new()),
+        pen_aspect: Mutex::new(HashMap::new()),
+        injector: std::sync::Mutex::new(inject::Injector::new(inject::ViewConfig {
+            union_w: cfg.desktop_w,
+            union_h: cfg.desktop_h,
+            area: cfg.area,
+            keep_aspect: cfg.keep_aspect,
+            rotation: cfg.rotation,
+            curve: cfg.pressure_curve,
+        })),
+        mail: Mutex::new(HashMap::new()),
+        profiles: Mutex::new(profiles),
+        runner: Mutex::new(ActionRunner::default()),
+        failsafe: std::sync::Mutex::new({
+            let mut f = Failsafe::default();
+            if let Err(e) = f.set_hotkey(&cfg.panic_hotkey) {
+                eprintln!("bad panic_hotkey {e:?}, keeping default");
+            }
+            f
+        }),
+    });
+
+    // Test hook (not a backdoor: only from process environment, used by
+    // smoke tests to preload one pairing without the QR/PIN UI).
+    // Format: CHIZ_TEST_PAIR=<device_id>:<base64 32-byte secret>
+    if let Ok(hook) = std::env::var("CHIZ_TEST_PAIR") {
+        for entry in hook.split(',') {
+            if let Some((id, sec_b64)) = entry.split_once(':') {
+                if let Ok(sec) = base64_b64_decode(sec_b64.trim()) {
+                    if sec.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&sec);
+                        shared
+                            .paired
+                            .lock()
+                            .await
+                            .secrets
+                            .insert(id.trim().into(), arr);
+                        eprintln!("test hook: pre-paired {}", id.trim());
+                    }
+                }
+            }
+        }
+    }
+
+    // Pairing window (deliberate action only: GUI "Pair new tablet";
+    // CHIZ_PAIRING=open is the headless/test equivalent).
+    if std::env::var("CHIZ_PAIRING").as_deref() == Ok("open") {
+        open_pairing(&shared, &id.fingerprint, cfg.control_port).await;
+    }
+
+    let udp = Arc::new(
+        UdpSocket::bind(("0.0.0.0", cfg.pen_port))
+            .await
+            .unwrap_or_else(|e| {
+                fatal(&format!(
+                    "cannot bind pen UDP port {} ({e}). Is Chiz already running?",
+                    cfg.pen_port
+                ))
+            }),
+    );
+    eprintln!(
+        "chiz companion listening: control TCP {}, pen UDP {}",
+        cfg.control_port, cfg.pen_port
+    );
+    eprintln!(
+        "panic hotkey: {} (+ Emergency release button)",
+        shared.failsafe.lock_ok().panic_hotkey.join("+")
+    );
+
+    let listener = TcpListener::bind(("0.0.0.0", cfg.control_port))
+        .await
+        .unwrap_or_else(|e| {
+            fatal(&format!(
+                "cannot bind control TCP port {} ({e}). Is Chiz already running?",
+                cfg.control_port
+            ))
+        });
+    // TLS 1.3 identity (spec 3): every control byte travels inside this
+    // acceptor. No plaintext fallback (spec 12.5).
+    let acceptor = tokio_rustls::TlsAcceptor::from(
+        identity::server_config(&id)
+            .unwrap_or_else(|e| fatal(&format!("cannot build the TLS config: {e}"))),
+    );
+    Boot {
+        cfg,
+        shared,
+        fp: id.fingerprint,
+        hostname: me,
+        udp,
+        listener,
+        acceptor,
+    }
+}
+
+/// Everything the server tasks and the GUI need. Built once at startup;
+/// the GUI thread never blocks on the runtime (all requests go through
+/// spawn/mailbox), so action buttons cannot wedge or crash the app.
+struct Boot {
+    cfg: Config,
+    shared: Arc<Shared>,
+    fp: [u8; 32],
+    hostname: String,
+    udp: Arc<UdpSocket>,
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+/// Register the global emergency hotkey; it works from any app, even with
+/// the GUI closed to the background. Failure is reported, never fatal.
+fn install_panic_hotkey(shared: &Arc<Shared>) {
+    let keys = shared.failsafe.lock_ok().panic_hotkey.clone();
+    let sh = Arc::clone(shared);
+    let hook = move || emergency_release(&sh);
+    #[cfg(unix)]
+    let ok = chiz_platform_linux::spawn_panic_hook(&keys, hook);
+    #[cfg(windows)]
+    let ok = chiz_platform_windows::spawn_panic_hook(&keys, hook);
+    if ok {
+        eprintln!("panic hotkey armed: {}", keys.join("+"));
+    } else {
+        banner(&format!(
+            "panic hotkey {} NOT available (no X11 session, or another app owns it). \
+             Use the Emergency release button or a 3-finger tap on the tablet strip.",
+            keys.join("+")
+        ));
+    }
+}
+
+fn main() {
+    #[cfg(windows)]
+    chiz_platform_windows::init_dpi_awareness();
+    // Manual runtime (not #[tokio::main]): the GUI event loop runs on the
+    // main thread OUTSIDE any runtime-enter context, so sync entry points
+    // (panic hook, tray, GUI buttons) can always hand work to the runtime
+    // without nested block_on deadlocks.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| fatal(&format!("cannot start the async runtime: {e}")));
+    let _ = RT.set(rt.handle().clone());
+    let boot = rt.block_on(setup());
+
+    // mDNS: convenience only, never required (manual IP entry always works).
+    let _mdns = mdns::start(&boot.hostname, boot.cfg.control_port, &boot.fp);
+
+    // Server tasks (spec 2 threading: pen never waits on control/UI).
+    rt.spawn(pen_task(Arc::clone(&boot.shared), Arc::clone(&boot.udp)));
+    rt.spawn(tick_task(Arc::clone(&boot.shared)));
+    spawn_foreground_poller(Arc::clone(&boot.shared));
+    install_panic_hotkey(&boot.shared);
+    rt.spawn(accept_task(
+        Arc::clone(&boot.shared),
+        boot.listener,
+        boot.acceptor,
+        boot.cfg.clone(),
+    ));
+
+    if gui::headless() {
+        eprintln!("headless mode: no window (unset CHIZ_HEADLESS / omit --headless for GUI)");
+        rt.block_on(std::future::pending::<()>());
+        return;
+    }
+    // GUI is the default: the main window opens on launch with status,
+    // pairing (QR + PIN), profiles, mapping, pressure and settings.
+    let gui_app = gui::GuiApp::new(
+        rt.handle().clone(),
+        boot.shared,
+        boot.fp,
+        boot.hostname,
+        boot.cfg.control_port,
+        boot.cfg.pen_port,
+    );
+    let opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([1024.0, 720.0]),
+        ..Default::default()
+    };
+    // NOTE: the OS global-hotkey thread (RegisterHotKey / XGrabKey, see
+    // platform crates) calls `emergency_release(&shared)` from outside the
+    // runtime. The GUI Emergency button calls it too via `tray_action`.
+    if let Err(e) = eframe::run_native(
+        "Chiz",
+        opts,
+        Box::new(|cc| {
+            theme::apply(&cc.egui_ctx);
+            Ok(Box::new(gui_app))
+        }),
+    ) {
+        eprintln!("GUI failed to open ({e}); continuing headless");
+        rt.block_on(std::future::pending::<()>());
+    }
+}
+
+async fn pen_task(shared: Arc<Shared>, sock: Arc<UdpSocket>) {
+    let mut buf = [0u8; 4096];
+    loop {
+        let Ok((n, src)) = sock.recv_from(&mut buf).await else {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            continue;
+        };
+        // Copy out: handle_pen_datagram awaits on locks.
+        let dg = buf[..n].to_vec();
+        handle_pen_datagram(&shared, &dg, src).await;
+    }
+}
+
+async fn tick_task(shared: Arc<Shared>) {
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        tick.tick().await;
+        watchdog_tick(&shared).await;
+    }
+}
+
+async fn accept_task(
+    shared: Arc<Shared>,
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    cfg: Config,
+) {
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(c) => c,
+            Err(e) => {
+                // EMFILE and friends: back off instead of spinning a core.
+                eprintln!("accept failed: {e}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+        let (cfg_c, sh_c, acc) = (cfg.clone(), Arc::clone(&shared), acceptor.clone());
+        // The handshake runs inside the per-connection task with a deadline:
+        // a silent or slow client must never stall other tablets' accepts.
+        tokio::spawn(async move {
+            let _ = tcp.set_nodelay(true);
+            let Ok(Ok(tls)) = tokio::time::timeout(Duration::from_secs(10), acc.accept(tcp)).await
+            else {
+                return; // handshake failure (wrong version, junk, stall): close
+            };
+            handle_conn(tls, peer, cfg_c, sh_c).await
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1065,7 +1550,10 @@ mod tests {
             pen_aspect: Mutex::new(HashMap::new()),
             injector: std::sync::Mutex::new(inject::Injector::new(inject::ViewConfig::default())),
             mail: Mutex::new(HashMap::new()),
-            profiles: Mutex::new(ProfileSet { profiles: vec![], locked: None }),
+            profiles: Mutex::new(ProfileSet {
+                profiles: vec![],
+                locked: None,
+            }),
             runner: Mutex::new(ActionRunner::default()),
             failsafe: std::sync::Mutex::new(Failsafe::default()),
         })
@@ -1076,9 +1564,17 @@ mod tests {
         let salt = [9u8; 16];
         let key = chiz_core::derive_pen_key(&secret, &salt);
         let r = chiz_core::PenRecord {
-            phase: 2, eraser: false, barrel1: false, barrel2: false,
-            x: 1000, y: 2000, pressure: 30000, tilt_x: 0, tilt_y: 0,
-            distance: 0, t_ms: 500,
+            phase: 2,
+            eraser: false,
+            barrel1: false,
+            barrel2: false,
+            x: 1000,
+            y: 2000,
+            pressure: 30000,
+            tilt_x: 0,
+            tilt_y: 0,
+            distance: 0,
+            t_ms: 500,
         };
         chiz_core::encrypt_datagram(&key, 9, 1, &[r])
     }
@@ -1088,11 +1584,11 @@ mod tests {
     #[tokio::test]
     async fn paused_pen_drops() {
         let sh = test_shared();
-        sh.failsafe.lock().expect("failsafe").pause(PauseReason::Manual);
+        sh.failsafe.lock_ok().pause(PauseReason::Manual);
         let src: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         let dg = test_datagram();
         handle_pen_datagram(&sh, &dg, src).await;
-        assert!(!sh.failsafe.lock().expect("failsafe").leave_pending);
+        assert!(!sh.failsafe.lock_ok().leave_pending);
         handle_pen_datagram(&sh, &dg, src).await; // second: no leave again
         assert_eq!(sh.pen_rx.lock().await[&9].highest_seq, 0); // never accepted
     }
@@ -1111,209 +1607,9 @@ mod tests {
     fn panic_from_foreign_thread() {
         let sh = test_shared();
         let moved = Arc::clone(&sh);
-        std::thread::spawn(move || emergency_release(&moved)).join().unwrap();
-        assert_eq!(sh.failsafe.lock().expect("failsafe").paused(), Some(PauseReason::Panic));
-    }
-}
-
-async fn setup() -> Boot {
-    let cfg = Config::load("companion/config.example.json");
-    let profiles = load_profiles();
-    eprintln!(
-        "profiles: {} loaded{}",
-        profiles.profiles.len(),
-        profiles
-            .profiles
-            .iter()
-            .find(|p| p.default)
-            .map(|p| format!(" (default: {})", p.id))
-            .unwrap_or_default()
-    );
-    let me = hostname();
-    let id = identity::load_or_generate(&me).expect("TLS identity");
-    eprintln!("identity dir: {}", identity::data_dir().display());
-    eprintln!("cert fingerprint sha256: {}", identity::fp_hex(&id.fingerprint));
-    let shared = Arc::new(Shared {
-        sessions: Mutex::new(SessionTable::default()),
-        auth: Mutex::new(control::AuthTracker::default()),
-        unauth_count: Mutex::new(0),
-        pairing: Mutex::new(pairing::PairingState::closed()),
-        paired: Mutex::new(PairedStore::default()),
-        fp: id.fingerprint,
-        pen_key: Mutex::new(HashMap::new()),
-        pen_rx: Mutex::new(HashMap::new()),
-        pen_aspect: Mutex::new(HashMap::new()),
-        injector: std::sync::Mutex::new(inject::Injector::new(inject::ViewConfig {
-            union_w: cfg.desktop_w,
-            union_h: cfg.desktop_h,
-            area: cfg.area,
-            keep_aspect: cfg.keep_aspect,
-            rotation: cfg.rotation,
-            curve: cfg.pressure_curve,
-        })),
-        mail: Mutex::new(HashMap::new()),
-        profiles: Mutex::new(profiles),
-        runner: Mutex::new(ActionRunner::default()),
-        failsafe: std::sync::Mutex::new({
-            let mut f = Failsafe::default();
-            if let Err(e) = f.set_hotkey(&cfg.panic_hotkey) {
-                eprintln!("bad panic_hotkey {e:?}, keeping default");
-            }
-            f
-        }),
-    });
-
-    // Test hook (not a backdoor: only from process environment, used by
-    // smoke tests to preload one pairing without the QR/PIN UI).
-    // Format: CHIZ_TEST_PAIR=<device_id>:<base64 32-byte secret>
-    if let Ok(hook) = std::env::var("CHIZ_TEST_PAIR") {
-        for entry in hook.split(',') {
-            if let Some((id, sec_b64)) = entry.split_once(':') {
-                if let Ok(sec) = base64_b64_decode(sec_b64.trim()) {
-                    if sec.len() == 32 {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&sec);
-                        shared.paired.lock().await.secrets.insert(id.trim().into(), arr);
-                        eprintln!("test hook: pre-paired {}", id.trim());
-                    }
-                }
-            }
-        }
-    }
-
-    // Pairing window (deliberate action only: tray "Pair new tablet";
-    // CHIZ_PAIRING=open is the headless/test equivalent).
-    if std::env::var("CHIZ_PAIRING").as_deref() == Ok("open") {
-        open_pairing(&shared, &id.fingerprint, cfg.control_port).await;
-    }
-
-    let udp = Arc::new(
-        UdpSocket::bind(("0.0.0.0", cfg.pen_port))
-            .await
-            .expect("bind pen UDP"),
-    );
-    eprintln!("chiz companion listening: control TCP {}, pen UDP {}", cfg.control_port, cfg.pen_port);
-    eprintln!(
-        "panic hotkey: {} (+ tray Emergency release)",
-        shared.failsafe.lock().expect("failsafe").panic_hotkey.join("+")
-    );
-
-    let listener = TcpListener::bind(("0.0.0.0", cfg.control_port))
-        .await
-        .expect("bind control TCP");
-    // TLS 1.3 identity (spec 3): every control byte travels inside this
-    // acceptor. No plaintext fallback (spec 12.5).
-    let acceptor = tokio_rustls::TlsAcceptor::from(identity::server_config(&id).expect("tls config"));
-    Boot {
-        cfg,
-        shared,
-        fp: id.fingerprint,
-        hostname: me,
-        udp,
-        listener,
-        acceptor,
-    }
-}
-
-/// Everything the server tasks and the GUI need. Built once at startup;
-/// the GUI thread never blocks on the runtime (all requests go through
-/// spawn/mailbox), so action buttons cannot wedge or crash the app.
-struct Boot {
-    cfg: Config,
-    shared: Arc<Shared>,
-    fp: [u8; 32],
-    hostname: String,
-    udp: Arc<UdpSocket>,
-    listener: TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
-}
-
-fn main() {
-    // Manual runtime (not #[tokio::main]): the GUI event loop runs on the
-    // main thread OUTSIDE any runtime-enter context, so sync entry points
-    // (panic hook, tray, GUI buttons) can always hand work to the runtime
-    // without nested block_on deadlocks.
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    let _ = RT.set(rt.handle().clone());
-    let boot = rt.block_on(setup());
-
-    // mDNS: convenience only, never required (manual IP entry always works).
-    let _mdns = mdns::start(&boot.hostname, boot.cfg.control_port, &boot.fp);
-
-    // Server tasks (spec 2 threading: pen never waits on control/UI).
-    rt.spawn(pen_task(Arc::clone(&boot.shared), Arc::clone(&boot.udp)));
-    rt.spawn(tick_task(Arc::clone(&boot.shared)));
-    rt.spawn(accept_task(
-        Arc::clone(&boot.shared),
-        boot.listener,
-        boot.acceptor,
-        boot.cfg.clone(),
-    ));
-
-    if gui::headless() {
-        eprintln!("headless mode: no window (unset CHIZ_HEADLESS / omit --headless for GUI)");
-        rt.block_on(std::future::pending::<()>());
-        return;
-    }
-    // GUI is the default: the main window opens on launch with status,
-    // pairing (QR + PIN), profiles, mapping, pressure and settings.
-    let gui_app = gui::GuiApp::new(
-        rt.handle().clone(),
-        boot.shared,
-        boot.fp,
-        boot.hostname,
-        boot.cfg.control_port,
-    );
-    let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1024.0, 720.0]),
-        ..Default::default()
-    };
-    // NOTE: the OS global-hotkey thread (RegisterHotKey / XGrabKey, see
-    // platform crates) calls `emergency_release(&shared)` from outside the
-    // runtime. Tray "Emergency release" calls it too via `tray_action`.
-    if let Err(e) = eframe::run_native("Chiz", opts, Box::new(|_cc| Ok(Box::new(gui_app)))) {
-        eprintln!("GUI failed to open ({e}); continuing headless");
-        rt.block_on(std::future::pending::<()>());
-    }
-}
-
-async fn pen_task(shared: Arc<Shared>, sock: Arc<UdpSocket>) {
-    let mut buf = [0u8; 4096];
-    loop {
-        let Ok((n, src)) = sock.recv_from(&mut buf).await else {
-            continue;
-        };
-        // Copy out: handle_pen_datagram awaits on locks.
-        let dg = buf[..n].to_vec();
-        handle_pen_datagram(&shared, &dg, src).await;
-    }
-}
-
-async fn tick_task(shared: Arc<Shared>) {
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
-    loop {
-        tick.tick().await;
-        watchdog_tick(&shared).await;
-    }
-}
-
-async fn accept_task(
-    shared: Arc<Shared>,
-    listener: TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
-    cfg: Config,
-) {
-    loop {
-        let Ok((tcp, peer)) = listener.accept().await else {
-            continue;
-        };
-        let Ok(tls) = acceptor.accept(tcp).await else {
-            continue; // handshake failure (wrong version, junk): just close
-        };
-        let (cfg_c, sh_c) = (cfg.clone(), Arc::clone(&shared));
-        tokio::spawn(async move { handle_conn(tls, peer, cfg_c, sh_c).await });
+        std::thread::spawn(move || emergency_release(&moved))
+            .join()
+            .unwrap();
+        assert_eq!(sh.failsafe.lock_ok().paused(), Some(PauseReason::Panic));
     }
 }

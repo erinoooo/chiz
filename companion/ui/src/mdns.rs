@@ -12,7 +12,10 @@ pub fn service_type() -> &'static str {
 
 /// TXT record: `v`, `id`, `name`. Hostname truncated to 32 chars (spec 3).
 pub fn txt_props(fingerprint: &[u8; 32], hostname: &str) -> HashMap<String, String> {
-    let id: String = fingerprint[..4].iter().map(|b| format!("{b:02x}")).collect();
+    let id: String = fingerprint[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     let name: String = hostname.chars().take(32).collect();
     HashMap::from([
         ("v".to_string(), "1".to_string()),
@@ -35,7 +38,11 @@ pub fn start(hostname: &str, port: u16, fingerprint: &[u8; 32]) -> Option<mdns_s
             return None;
         }
     };
-    let fullname = format!("{}.{}.", instance_name(hostname).replace(' ', "-"), service_type().trim_end_matches('.'));
+    let fullname = format!(
+        "{}.{}.",
+        instance_name(hostname).replace(' ', "-"),
+        service_type().trim_end_matches('.')
+    );
     let svc = match mdns_sd::ServiceInfo::new(
         service_type(),
         &instance_name(hostname),

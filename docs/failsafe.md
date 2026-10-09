@@ -8,17 +8,19 @@ single wedged component cannot block all of them.
 
 Press it anywhere, even while drawing. It instantly lifts the pen, leaves
 range, releases every held key and mouse button, and pauses pen input.
-Hammer it — it is idempotent. Resume from the tray when calm.
+Hammer it — it is idempotent. Resume from the Chiz window when calm.
 
-- Change it in `config.json` via `panic_hotkey` (same `keys` grammar as
+- Change it in `config.json` (see *Configuration* in the README) via
+  `panic_hotkey` (same `keys` grammar as
   buttons, e.g. `"ctrl+alt+p"`). An invalid value keeps the default and
   logs a warning.
 - Implemented as an OS-level hook on its own thread (`RegisterHotKey` on
   Windows, `XGrabKey` on X11), outside the session tasks, touching neither
-  network nor disk. On Wayland without the GlobalShortcuts portal, use the
-  tray item instead — the UI says so.
+  network nor disk. On a pure-Wayland session (no X11/XWayland) the grab is
+  unavailable: the companion logs that at startup — use the window's
+  Emergency release button instead.
 
-## 2. Tray: Emergency release / Pause pen input
+## 2. Window: Emergency release / Pause pen input
 
 Same effect as the hotkey, plus a manual pause toggle. While paused, pen
 records are dropped (one transitional `leave`), **buttons keep working**,
@@ -37,7 +39,7 @@ If the pen watchdog has to repair a stuck pen 3 times in a row with no
 clean input between, the companion auto-pauses pen input and banners
 "Pen auto-paused after repeated stuck input." This catches silent UDP
 blackholes (AT-8 style loss) without you noticing the mechanics. Resume
-from the tray; the counter resets on any clean stroke.
+from the Chiz window; the counter resets on any clean stroke.
 
 ## What to check afterward
 

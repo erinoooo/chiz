@@ -186,12 +186,7 @@ impl Backend for RecBackend {
 // Device creation (real backend only).
 
 fn open_uinput() -> std::io::Result<std::os::fd::RawFd> {
-    let fd = unsafe {
-        libc::open(
-            c"/dev/uinput".as_ptr(),
-            libc::O_WRONLY | libc::O_NONBLOCK,
-        )
-    };
+    let fd = unsafe { libc::open(c"/dev/uinput".as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
     if fd < 0 {
         let e = std::io::Error::last_os_error();
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -204,7 +199,12 @@ fn open_uinput() -> std::io::Result<std::os::fd::RawFd> {
     Ok(fd)
 }
 
-fn setup_common(fd: std::os::fd::RawFd, name: &str, keys: &[u16], abs: &[(u16, i32, i32, i32)]) -> std::io::Result<()> {
+fn setup_common(
+    fd: std::os::fd::RawFd,
+    name: &str,
+    keys: &[u16],
+    abs: &[(u16, i32, i32, i32)],
+) -> std::io::Result<()> {
     let io = |req: u64, arg: i64| -> std::io::Result<()> {
         if unsafe { libc::ioctl(fd, req as _, arg) } < 0 {
             return Err(std::io::Error::last_os_error());
@@ -264,7 +264,13 @@ pub fn create_pen(union_w: i32, union_h: i32) -> std::io::Result<FdBackend> {
     setup_common(
         fd,
         "Chiz Pen",
-        &[BTN_TOOL_PEN, BTN_TOOL_RUBBER, BTN_TOUCH, BTN_STYLUS, BTN_STYLUS2],
+        &[
+            BTN_TOOL_PEN,
+            BTN_TOOL_RUBBER,
+            BTN_TOUCH,
+            BTN_STYLUS,
+            BTN_STYLUS2,
+        ],
         &[
             (ABS_X, 0, union_w - 1, 4),
             (ABS_Y, 0, union_h - 1, 4),
@@ -285,9 +291,35 @@ pub fn create_pen(union_w: i32, union_h: i32) -> std::io::Result<FdBackend> {
 /// Every key name the section-11 table knows, for EV_KEY declaration.
 pub fn all_key_names() -> Vec<String> {
     let mut names = vec![
-        "ctrl", "shift", "alt", "meta", "space", "enter", "tab", "esc", "backspace", "delete", "insert",
-        "home", "end", "pageup", "pagedown", "left", "up", "right", "down", "minus", "equal",
-        "bracketleft", "bracketright", "comma", "period", "slash", "backslash", "semicolon", "quote",
+        "ctrl",
+        "shift",
+        "alt",
+        "meta",
+        "space",
+        "enter",
+        "tab",
+        "esc",
+        "backspace",
+        "delete",
+        "insert",
+        "home",
+        "end",
+        "pageup",
+        "pagedown",
+        "left",
+        "up",
+        "right",
+        "down",
+        "minus",
+        "equal",
+        "bracketleft",
+        "bracketright",
+        "comma",
+        "period",
+        "slash",
+        "backslash",
+        "semicolon",
+        "quote",
         "grave",
     ]
     .into_iter()
@@ -378,7 +410,17 @@ impl<B: Backend> PenDevice<B> {
         }
     }
 
-    fn axes(&mut self, x: i32, y: i32, pressure01: f64, distance01: f64, tilt_x: i8, tilt_y: i8, touch_pressure: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn axes(
+        &mut self,
+        x: i32,
+        y: i32,
+        pressure01: f64,
+        distance01: f64,
+        tilt_x: i8,
+        tilt_y: i8,
+        touch_pressure: bool,
+    ) {
         let p = if touch_pressure {
             (pressure01 * PRESSURE_MAX as f64).round() as i32
         } else {
@@ -500,19 +542,18 @@ pub fn emit_combo<B: Backend>(backend: &mut B, keys: &[String], hold: bool) {
         .filter(|k| chiz_core::profile::is_modifier(k))
         .collect();
     let main = keys.last().cloned().unwrap_or_default();
-    let code = |n: &str| chiz_core::profile::key_codes(n).map(|(_, ev)| ev).unwrap_or(0);
+    let code = |n: &str| {
+        chiz_core::profile::key_codes(n)
+            .map(|(_, ev)| ev)
+            .unwrap_or(0)
+    };
     for m in &mods {
         backend.emit(EV_KEY, code(m), 1);
         backend.sync();
     }
-    if chiz_core::profile::is_modifier(&main) && keys.len() == 1 {
-        backend.emit(EV_KEY, code(&main), 1);
-        backend.sync();
-        if !hold {
-            backend.emit(EV_KEY, code(&main), 0);
-            backend.sync();
-        }
-    } else if !chiz_core::profile::is_modifier(&main) {
+    // A lone modifier is its own main key; otherwise the trailing token is
+    // pressed only when it is not a modifier already pressed above.
+    if !chiz_core::profile::is_modifier(&main) || keys.len() == 1 {
         backend.emit(EV_KEY, code(&main), 1);
         backend.sync();
         if !hold {
@@ -528,11 +569,13 @@ pub fn emit_combo<B: Backend>(backend: &mut B, keys: &[String], hold: bool) {
     }
 }
 
-/// X11 panic-hook entry. Real `XGrabKey` loop lands here (needs an X
-/// display at runtime); until then this documents the contract: `on_panic`
-/// runs on its own OS thread and must only flip the failsafe + release.
-pub fn spawn_panic_hook(_on_panic: impl Fn() + Send + 'static) {
-    // TODO(M7): XOpenDisplay/XGrabKey/XNextEvent loop on a std::thread.
+pub mod x11;
+
+/// Install the global panic hotkey (X11 `XGrabKey`). `on_panic` runs on its
+/// own OS thread and must only flip the failsafe + hand off release work.
+/// Returns false when no X server exists (Wayland) or the combo is taken.
+pub fn spawn_panic_hook(hotkey: &[String], on_panic: impl Fn() + Send + 'static) -> bool {
+    x11::spawn_panic_hook(hotkey, on_panic)
 }
 
 #[cfg(test)]
@@ -544,7 +587,9 @@ mod tests {
     }
 
     fn syns(ev: &[(u16, u16, i32)]) -> usize {
-        ev.iter().filter(|(t, c, _)| *t == EV_SYN && *c == SYN_REPORT).count()
+        ev.iter()
+            .filter(|(t, c, _)| *t == EV_SYN && *c == SYN_REPORT)
+            .count()
     }
 
     #[test]
@@ -577,8 +622,14 @@ mod tests {
         d.backend.events.clear();
         d.record(Phase::Hover, 50, 50, 0.0, 0.3, 0, 0, true, false, false);
         let ev = &d.backend.events;
-        let off = ev.iter().position(|e| *e == (EV_KEY, BTN_TOOL_PEN, 0)).unwrap();
-        let on = ev.iter().position(|e| *e == (EV_KEY, BTN_TOOL_RUBBER, 1)).unwrap();
+        let off = ev
+            .iter()
+            .position(|e| *e == (EV_KEY, BTN_TOOL_PEN, 0))
+            .unwrap();
+        let on = ev
+            .iter()
+            .position(|e| *e == (EV_KEY, BTN_TOOL_RUBBER, 1))
+            .unwrap();
         assert!(off < on); // separate reports, leave before hover
     }
 

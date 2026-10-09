@@ -30,7 +30,7 @@ impl PairingState {
         }
     }
 
-    /// Open a window (deliberate user action: tray "Pair new tablet").
+    /// Open a window (deliberate user action: GUI "Pair new tablet").
     /// Returns (token, pin) for display.
     pub fn open(&mut self, now: f64) -> ([u8; 16], String) {
         let mut token = [0u8; 16];
@@ -61,7 +61,13 @@ impl PairingState {
 
     /// PIN-mode proof: `HMAC(PIN, "chiz-pair-v1"||fp||nonce||device_id)`.
     /// The tablet binds the fingerprint it *observed*, so a MITM cert fails.
-    pub fn verify_pin(&self, proof_b64: &str, fp_seen: &[u8; 32], nonce: &[u8; 16], device_id: &str) -> bool {
+    pub fn verify_pin(
+        &self,
+        proof_b64: &str,
+        fp_seen: &[u8; 32],
+        nonce: &[u8; 16],
+        device_id: &str,
+    ) -> bool {
         let expect = compute_pin_proof(&self.pin, fp_seen, nonce, device_id);
         crate::ct_eq(expect.as_bytes(), proof_b64.as_bytes())
     }
@@ -143,7 +149,12 @@ mod tests {
             &nonce,
             "5b0f6c1e-7d0a-4a55-9d3e-0c6f1a2b3c4d"
         ));
-        assert!(!st.verify_pin("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", &fp, &nonce, "5b0f6c1e-7d0a-4a55-9d3e-0c6f1a2b3c4d"));
+        assert!(!st.verify_pin(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            &fp,
+            &nonce,
+            "5b0f6c1e-7d0a-4a55-9d3e-0c6f1a2b3c4d"
+        ));
         // MITM fingerprint fails even with the right PIN.
         let mut other = fp;
         other[0] ^= 1;

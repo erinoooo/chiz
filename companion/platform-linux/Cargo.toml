@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 chiz-core = { path = "../core" }
 libc = "0.2"
+x11rb = { version = "0.13", default-features = false }

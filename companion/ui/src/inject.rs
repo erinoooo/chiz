@@ -6,10 +6,10 @@
 
 use chiz_core::{apply_pressure_curve, map_pen_to_px};
 
-#[cfg(unix)]
-use chiz_platform_linux::Backend;
 #[cfg(windows)]
 use chiz_core::platform::Platform as _;
+#[cfg(unix)]
+use chiz_platform_linux::Backend;
 
 #[derive(Clone, Debug)]
 pub struct ViewConfig {
@@ -34,8 +34,21 @@ impl Default for ViewConfig {
     }
 }
 
+/// Latest decoded pen record, for the GUI's live readout (raw 0..1 values).
+#[derive(Clone, Debug, Default)]
+pub struct PenSample {
+    pub x: f64,
+    pub y: f64,
+    pub pressure: f64,
+    pub tilt_x: i8,
+    pub tilt_y: i8,
+    pub eraser: bool,
+    pub barrel: bool,
+}
+
 pub struct Injector {
     pub view: ViewConfig,
+    pub last_pen: PenSample,
     #[cfg(unix)]
     pen: Option<chiz_platform_linux::PenDevice<chiz_platform_linux::FdBackend>>,
     #[cfg(unix)]
@@ -50,6 +63,7 @@ impl Injector {
     pub fn new(view: ViewConfig) -> Self {
         Self {
             view,
+            last_pen: PenSample::default(),
             #[cfg(unix)]
             pen: None,
             #[cfg(unix)]
@@ -58,20 +72,6 @@ impl Injector {
             win: chiz_platform_windows::WindowsPlatform::default(),
             #[cfg(unix)]
             last_ensure: 0.0,
-        }
-    }
-
-    pub fn set_view(&mut self, view: ViewConfig) {
-        let changed = view.union_w != self.view.union_w || view.union_h != self.view.union_h;
-        self.view = view;
-        if changed {
-            // Union resize recreates the Linux device, but only while the
-            // pen is not touching (spec 10) — handled by dropping here and
-            // recreating on next ensure() when idle.
-            #[cfg(unix)]
-            {
-                self.pen = None;
-            }
         }
     }
 
@@ -109,21 +109,6 @@ impl Injector {
         }
     }
 
-    pub fn available(&self) -> bool {
-        #[cfg(unix)]
-        {
-            self.pen.is_some()
-        }
-        #[cfg(windows)]
-        {
-            true
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            false
-        }
-    }
-
     /// Map + curve + inject one decoded record. Raw record values in,
     /// OS events out; the eraser flag already includes eraser_toggle.
     #[allow(clippy::too_many_arguments)]
@@ -141,6 +126,15 @@ impl Injector {
         barrel2: bool,
         pen_aspect: (u32, u32),
     ) {
+        self.last_pen = PenSample {
+            x: x as f64 / 65535.0,
+            y: y as f64 / 65535.0,
+            pressure: pressure as f64 / 65535.0,
+            tilt_x,
+            tilt_y,
+            eraser,
+            barrel: barrel1 || barrel2,
+        };
         let (pw, ph) = (pen_aspect.0.max(1) as f64, pen_aspect.1.max(1) as f64);
         let (mx, my) = map_pen_to_px(
             x as f64 / 65535.0,
@@ -170,9 +164,22 @@ impl Injector {
                     _ => LP::Leave, // cancel handled below as up+leave
                 };
                 if phase_u8 == 5 {
-                    dev.record(LP::Up, mx as i32, my as i32, p, dist, tilt_x, tilt_y, eraser, barrel1, barrel2);
+                    dev.record(
+                        LP::Up,
+                        mx as i32,
+                        my as i32,
+                        p,
+                        dist,
+                        tilt_x,
+                        tilt_y,
+                        eraser,
+                        barrel1,
+                        barrel2,
+                    );
                 }
-                dev.record(ph, mx as i32, my as i32, p, dist, tilt_x, tilt_y, eraser, barrel1, barrel2);
+                dev.record(
+                    ph, mx as i32, my as i32, p, dist, tilt_x, tilt_y, eraser, barrel1, barrel2,
+                );
                 return;
             }
         }
@@ -213,9 +220,9 @@ impl Injector {
                 barrel1,
                 barrel2,
             });
-            return;
         }
         // No device (or unsupported target): log so sessions stay visible.
+        #[cfg(not(windows))]
         eprintln!(
             "inject_pen phase={phase_u8} x={mx} y={my} p={p:.3} tilt={tilt_x}/{tilt_y} eraser={eraser}"
         );
@@ -233,30 +240,9 @@ impl Injector {
         #[cfg(windows)]
         {
             self.win.inject_key(key, down);
-            return;
         }
+        #[cfg(not(windows))]
         eprintln!("inject_key {key} {}", if down { "down" } else { "up" });
-    }
-
-    /// Full combination press (tap/macros): ordered with SYN batching.
-    pub fn combo(&mut self, keys: &[String], hold: bool) {
-        #[cfg(unix)]
-        {
-            if let Some(kb) = self.keys.as_mut() {
-                chiz_platform_linux::emit_combo(kb, keys, hold);
-                return;
-            }
-        }
-        #[cfg(windows)]
-        {
-            for (k, d) in chiz_core::profile::plan_key_press(keys, hold, false) {
-                self.win.inject_key(&k, d);
-            }
-            return;
-        }
-        for (k, d) in chiz_core::profile::plan_key_press(keys, hold, false) {
-            eprintln!("inject_key {k} {}", if d { "down" } else { "up" });
-        }
     }
 
     pub fn key_release(&mut self, key: &str) {
@@ -274,8 +260,8 @@ impl Injector {
         #[cfg(windows)]
         {
             self.win.inject_key(key, false);
-            return;
         }
+        #[cfg(not(windows))]
         eprintln!("inject_key {key} up");
     }
 
@@ -283,7 +269,9 @@ impl Injector {
         #[cfg(unix)]
         {
             if let Some(kb) = self.keys.as_mut() {
-                use chiz_platform_linux::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, EV_KEY, EV_SYN, SYN_REPORT};
+                use chiz_platform_linux::{
+                    BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, EV_KEY, EV_SYN, SYN_REPORT,
+                };
                 let code = match button {
                     "left" => BTN_LEFT,
                     "right" => BTN_RIGHT,
@@ -298,8 +286,8 @@ impl Injector {
         #[cfg(windows)]
         {
             self.win.inject_mouse(button, down);
-            return;
         }
+        #[cfg(not(windows))]
         eprintln!("inject_mouse {button} {}", if down { "down" } else { "up" });
     }
 
@@ -332,20 +320,5 @@ impl Injector {
             }
         }
         eprintln!("inject_pen leave (no device)");
-    }
-
-    pub fn release_all(&mut self) {
-        #[cfg(unix)]
-        {
-            // Held-key tracking lives in the action runner; the devices only
-            // need pen lifted (keys are released as explicit ups).
-            if let Some(dev) = self.pen.as_mut() {
-                dev.force_leave();
-            }
-        }
-        #[cfg(windows)]
-        {
-            self.win.release_all();
-        }
     }
 }
