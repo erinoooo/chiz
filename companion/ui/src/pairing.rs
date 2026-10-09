@@ -34,9 +34,9 @@ impl PairingState {
     /// Returns (token, pin) for display.
     pub fn open(&mut self, now: f64) -> ([u8; 16], String) {
         let mut token = [0u8; 16];
-        crate::os_random(&mut token);
+        crate::util::os_random(&mut token);
         let mut raw = [0u8; 4];
-        crate::os_random(&mut raw);
+        crate::util::os_random(&mut raw);
         let pin = format!("{:08}", u32::from_le_bytes(raw) % 100_000_000);
         self.window.open_at = Some(now);
         self.window.now = now;
@@ -53,10 +53,10 @@ impl PairingState {
 
     /// QR-mode proof: constant-time token compare.
     pub fn verify_qr(&self, token_b64: &str) -> bool {
-        let Ok(raw) = crate::base64_b64_decode(token_b64) else {
+        let Ok(raw) = crate::util::b64_decode(token_b64) else {
             return false;
         };
-        crate::ct_eq(&raw, &self.token)
+        crate::util::ct_eq(&raw, &self.token)
     }
 
     /// PIN-mode proof: `HMAC(PIN, "chiz-pair-v1"||fp||nonce||device_id)`.
@@ -69,7 +69,7 @@ impl PairingState {
         device_id: &str,
     ) -> bool {
         let expect = compute_pin_proof(&self.pin, fp_seen, nonce, device_id);
-        crate::ct_eq(expect.as_bytes(), proof_b64.as_bytes())
+        crate::util::ct_eq(expect.as_bytes(), proof_b64.as_bytes())
     }
 
     pub fn attempts_left(&self) -> u32 {

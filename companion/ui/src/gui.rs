@@ -2,24 +2,22 @@
 //! window by default. `--headless`, `CHIZ_HEADLESS=1`, or no display server
 //! runs server-only (logs + mDNS + tablet only).
 //!
-//! The screens in `screens.rs` stay I/O-free: each frame syncs them from
-//! `Shared` with non-blocking locks, renders, then executes any
-//! [PendingAction](super::screens::PendingAction)s the buttons queued.
+//! The screens in `screens.rs` stay I/O-free: each frame copies a snapshot
+//! out of `App` (short std-mutex reads), renders, then runs the
+//! [PendingAction](super::screens::PendingAction)s the buttons queued. Every
+//! action is a plain synchronous `App` call: the GUI thread never waits on
+//! the async runtime.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::app::App;
 use super::screens::{CompanionApp, PendingAction};
-use super::{broadcast_profile, emergency_release, open_pairing, tray_action, LockExt, Shared};
+use super::util::{now_secs, LockExt};
 use chiz_core::failsafe::PauseReason;
 
 pub struct GuiApp {
-    rt: tokio::runtime::Handle,
-    shared: Arc<Shared>,
-    fp: [u8; 32],
-    hostname: String,
-    port: u16,
-    pen_port: u16,
+    core: Arc<App>,
     app: CompanionApp,
     qr_tex: Option<egui::TextureHandle>,
     qr_mtime: Option<std::time::SystemTime>,
@@ -32,21 +30,9 @@ pub struct GuiApp {
 type ViewKey = ((f64, f64, f64, f64), bool, u16, [f64; 4]);
 
 impl GuiApp {
-    pub fn new(
-        rt: tokio::runtime::Handle,
-        shared: Arc<Shared>,
-        fp: [u8; 32],
-        hostname: String,
-        port: u16,
-        pen_port: u16,
-    ) -> Self {
+    pub fn new(core: Arc<App>) -> Self {
         let mut me = Self {
-            rt,
-            shared,
-            fp,
-            hostname,
-            port,
-            pen_port,
+            core,
             app: CompanionApp::default(),
             qr_tex: None,
             qr_mtime: None,
@@ -91,7 +77,7 @@ impl GuiApp {
 
     /// Start the sliders from the real configured view, not defaults.
     fn seed_view(&mut self) {
-        let v = self.shared.injector.lock_ok().view.clone();
+        let v = self.core.injector.lock_ok().view.clone();
         self.app.mapping.area = [v.area.0, v.area.1, v.area.2, v.area.3];
         self.app.mapping.keep_aspect = v.keep_aspect;
         self.app.mapping.rotation = v.rotation;
@@ -99,31 +85,20 @@ impl GuiApp {
     }
 
     fn sync(&mut self) {
-        // Sessions: dot + tablet name.
-        if let Ok(s) = self.shared.sessions.try_lock() {
-            let tabs = s.tablets();
-            self.app.status.connected = !tabs.is_empty();
-            self.app.status.reconnecting = false;
-            self.app.status.tablet_name = tabs.join(", ");
-        }
-        // Drop counters across receivers.
-        if let Ok(rx) = self.shared.pen_rx.try_lock() {
-            self.app.status.dropped = rx
-                .values()
-                .map(|r| {
-                    (r.drops.bad_magic
-                        + r.drops.bad_session
-                        + r.drops.bad_tag
-                        + r.drops.wrong_ip
-                        + r.drops.old_seq
-                        + r.drops.old_tms
-                        + r.drops.identical) as u64
-                })
-                .sum();
-        }
-        // Live pen sample + current view (what the injector is using).
+        let core = &self.core;
+        // Session + pairing (one short hub lock).
+        let hub = core.hub.lock_ok().status(now_secs());
+        self.app.status.connected = hub.tablet.is_some();
+        self.app.status.reconnecting = false;
+        self.app.status.tablet_name = hub.tablet.map(|(name, _)| name).unwrap_or_default();
+        self.app.status.dropped = hub.dropped;
+        self.app.tablets.pairing_open = hub.pairing_open;
+        self.app.tablets.countdown_s = hub.pairing_left_s;
+        self.app.tablets.pin = hub.pin;
+        self.app.tablets.paired = hub.paired;
+        // Live pen sample.
         {
-            let inj = self.shared.injector.lock_ok();
+            let inj = core.injector.lock_ok();
             let l = &inj.last_pen;
             self.app.status.pen = super::screens::LivePen {
                 x: l.x,
@@ -140,9 +115,9 @@ impl GuiApp {
             };
             self.app.pressure.live_raw = l.pressure;
         }
-        // Failsafe: pause flag + banner (std mutex: never blocks).
+        // Failsafe banner.
         {
-            let fs = self.shared.failsafe.lock_ok();
+            let fs = core.failsafe.lock_ok();
             self.app.status.paused = fs.paused().is_some();
             self.app.status.banner = match fs.paused() {
                 Some(PauseReason::AutoStuck) => {
@@ -151,62 +126,34 @@ impl GuiApp {
                 Some(PauseReason::Panic) => "Emergency release active. Resume when ready.".into(),
                 _ => String::new(),
             };
-            if self.app.settings.panic_hotkey.is_empty() {
-                self.app.settings.panic_hotkey = fs.panic_hotkey.join("+");
-            }
+            self.app.settings.panic_hotkey = fs.panic_hotkey.join("+");
         }
-        // Pairing window: open flag, countdown, PIN.
-        if let Ok(mut p) = self.shared.pairing.try_lock() {
-            let open = p.is_open(super::now_secs());
-            self.app.tablets.pairing_open = open;
-            if open {
-                let left = 120 - (super::now_secs() - p.window.open_at.unwrap_or(0.0)) as u64;
-                self.app.tablets.countdown_s = left.min(120);
-                self.app.tablets.pin = p.pin.clone();
-            }
-        }
-        // Profiles: ids + manual lock.
-        if let Ok(ps) = self.shared.profiles.try_lock() {
+        // Profiles.
+        {
+            let ps = core.profiles.lock_ok();
             self.app.status.profile = ps
                 .current()
                 .map(|p| p.name.clone())
                 .unwrap_or_else(|| "-".into());
-            self.app.status.app = super::foreground_app().unwrap_or_default();
+            self.app.status.app = ps.foreground.clone().unwrap_or_default();
             self.app.profiles.ids = ps.profiles.iter().map(|p| p.id.clone()).collect();
             self.app.profiles.selected = ps.locked.clone();
         }
-        // Paired tablets: id + stored name.
-        if let Ok(paired) = self.shared.paired.try_lock() {
-            let mut v: Vec<(String, String)> = paired
-                .secrets
-                .keys()
-                .map(|id| {
-                    (
-                        id.clone(),
-                        paired.names.get(id).cloned().unwrap_or_else(|| id.clone()),
-                    )
-                })
-                .collect();
-            v.sort();
-            self.app.tablets.paired = v;
-        }
         // This PC's identity, for comparing with the tablet's mismatch text.
-        self.app.tablets.cert_id = super::identity::fp_hex(&self.fp).chars().take(8).collect();
+        self.app.tablets.cert_id = super::identity::fp_hex(&core.fp).chars().take(8).collect();
         if self.app.screen == super::screens::Screen::Tablets
             && self
                 .hosts_at
                 .is_none_or(|t| t.elapsed() > Duration::from_secs(5))
         {
-            self.app.tablets.hosts = super::local_ipv4_hosts();
+            self.app.tablets.hosts = super::server::lan_hosts();
             self.hosts_at = Some(std::time::Instant::now());
         }
-        // Settings snapshot.
         self.app.mapping.monitors = vec!["primary".to_string(), "all".to_string()];
-        self.app.settings.control_port = self.port;
-        self.app.settings.pen_port = self.pen_port;
+        self.app.settings.control_port = core.cfg.control_port;
+        self.app.settings.pen_port = core.cfg.pen_port;
         self.app.settings.wayland_note =
             std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland");
-        let _ = self.hostname.clone();
     }
 
     /// Mapping + pressure edits take effect immediately; nothing is pushed
@@ -223,7 +170,7 @@ impl GuiApp {
             return;
         }
         if self.pushed_view.is_some() {
-            let mut inj = self.shared.injector.lock_ok();
+            let mut inj = self.core.injector.lock_ok();
             inj.view.area = want.0;
             inj.view.keep_aspect = want.1;
             inj.view.rotation = want.2;
@@ -234,42 +181,11 @@ impl GuiApp {
 
     fn exec(&self, action: PendingAction) {
         match action {
-            PendingAction::Panic => emergency_release(&self.shared),
-            PendingAction::PauseToggle => {
-                let paused = self.shared.failsafe.lock_ok().paused().is_some();
-                tray_action(&self.shared, if paused { "resume" } else { "pause" });
-            }
-            PendingAction::PairOpen => {
-                let port = self.port;
-                self.rt.block_on(open_pairing(&self.shared, &self.fp, port));
-            }
-            PendingAction::ForgetTablet(id) => {
-                {
-                    let mut paired = self.shared.paired.blocking_lock();
-                    paired.secrets.remove(&id);
-                    paired.names.remove(&id);
-                    paired.save();
-                }
-                // Single-tablet design: forgetting drops all live pen state.
-                // The orphaned socket reaps on the 5 s liveness deadline.
-                self.shared.sessions.blocking_lock().remove_device(&id);
-                self.shared.pen_rx.blocking_lock().clear();
-                self.shared.pen_key.blocking_lock().clear();
-                let rel = self.shared.runner.blocking_lock().release_all();
-                super::drive_all(self.shared.as_ref(), &rel);
-                super::release_all("forget tablet");
-                super::banner(&format!("Tablet forgotten ({id})."));
-            }
-            PendingAction::ProfileLock(target) => {
-                let target = target.unwrap_or_else(|| "auto".to_string());
-                let next = self.shared.profiles.blocking_lock().switch(&target);
-                if let Some((id, reason)) = next {
-                    let rel = self.shared.runner.blocking_lock().release_all();
-                    super::drive_all(self.shared.as_ref(), &rel);
-                    self.rt.block_on(broadcast_profile(&self.shared, &reason));
-                    super::banner(&format!("Profile locked: {id}"));
-                }
-            }
+            PendingAction::Panic => self.core.emergency_release(),
+            PendingAction::PauseToggle => self.core.toggle_pause(),
+            PendingAction::PairOpen => self.core.open_pairing(),
+            PendingAction::ForgetTablet(id) => self.core.forget_tablet(&id),
+            PendingAction::ProfileLock(target) => self.core.lock_profile(target.as_deref()),
         }
     }
 }

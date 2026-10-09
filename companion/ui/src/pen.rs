@@ -1,82 +1,138 @@
-//! UDP pen loop: one receive task -> PenReceiver -> injection task.
-//! Spec section 5 (receiver rules) + section 8 (pen pipeline order).
+//! UDP pen path (spec 5, 8) and the stuck-pen watchdog.
 //!
-//! Wiring: `tokio::net::UdpSocket` bound on the pen port feeds datagrams to
-//! `chiz_core::PenReceiver::accept` (magic/session/IP/seq/tag/t_ms/identical
-//! filtering with drop counters shown on the status screen). Accepted records
-//! go through rotate+map -> pressure curve -> eraser-toggle -> `inject_pen`
-//! on the platform layer, after `PenState` repair (chiz-core). Watchdog task
-//! injects up+leave (750 ms down-silence) or leave (1000 ms hover-silence).
-//!
-//! Threading (spec 2): this UDP task never touches disk, DNS, UI, or the
-//! control channel. Decoded records cross to the injection task over a
-//! bounded channel; on overflow the oldest move/hover is dropped (tablet
-//! mirrors this on its sender queue).
+//! The UDP task never waits on control, UI or disk work (spec 2): per
+//! datagram it takes the hub lock only long enough to authenticate and
+//! decrypt against the active session, then injects.
+
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use chiz_core::{PenReceiver, PenRecord};
+use tokio::net::UdpSocket;
 
-/// Outcome of one datagram for the status-screen counters.
-#[allow(dead_code)]
-#[derive(Debug, Default)]
-pub struct PenStats {
-    pub accepted: u64,
-    pub dropped: u64,
+use crate::app::{banner, App};
+use crate::util::{now_secs, LockExt};
+
+pub async fn udp_task(app: Arc<App>, sock: UdpSocket) {
+    let mut buf = [0u8; 2048];
+    loop {
+        match sock.recv_from(&mut buf).await {
+            Ok((n, src)) => on_datagram(&app, &buf[..n], src.ip()),
+            Err(e) => {
+                // Windows reports ICMP port-unreachable as a recv error;
+                // never spin on it.
+                eprintln!("pen UDP receive error: {e}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
 }
 
-/// Filter one datagram through the receiver; pure wrapper so the async loop
-/// stays thin and this stays unit-testable without sockets.
-#[allow(dead_code)]
-pub fn handle_datagram(
+/// Filter one datagram (session, source IP, replay, tag) and inject it.
+pub fn on_datagram(app: &App, dg: &[u8], src: IpAddr) {
+    let Some(sid) = dg
+        .get(2..6)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    else {
+        return;
+    };
+    {
+        // Pause gate: drop pen records; buttons are unaffected.
+        let mut fs = app.failsafe.lock_ok();
+        if fs.drop_pen() {
+            fs.leave_pending = false;
+            return;
+        }
+    }
+    let now = now_secs();
+    let (records, aspect) = {
+        let mut hub = app.hub.lock_ok();
+        let Some(a) = hub.active_mut() else {
+            return; // no session: drop
+        };
+        if a.sid != sid {
+            return; // stale or foreign session id (spec 4/5)
+        }
+        let key = a.pen_key;
+        (accept(&mut a.rx, dg, src, &key, now), a.aspect)
+    };
+    if records.is_empty() {
+        return;
+    }
+    let eraser_forced = app.runner.lock_ok().eraser_on;
+    {
+        let mut inj = app.injector.lock_ok();
+        inj.ensure(now);
+        // Pipeline order (spec 8): rotate+map -> pressure curve ->
+        // eraser-toggle -> inject.
+        for r in records {
+            inj.pen(
+                r.phase,
+                r.x,
+                r.y,
+                r.pressure,
+                r.distance,
+                r.tilt_x,
+                r.tilt_y,
+                r.eraser || eraser_forced,
+                r.barrel1,
+                r.barrel2,
+                aspect,
+            );
+        }
+    }
+    app.failsafe.lock_ok().note_clean_input();
+}
+
+fn accept(
     rx: &mut PenReceiver,
-    datagram: &[u8],
-    src_ip: &str,
-    pen_key: &[u8; 32],
-    now_secs: f64,
-) -> (Vec<PenRecord>, PenStats) {
-    let before = rx.drops.bad_magic
-        + rx.drops.bad_session
-        + rx.drops.bad_tag
-        + rx.drops.wrong_ip
-        + rx.drops.old_seq
-        + rx.drops.old_tms
-        + rx.drops.identical;
-    let recs = rx.accept(datagram, src_ip, pen_key, now_secs);
-    let after = rx.drops.bad_magic
-        + rx.drops.bad_session
-        + rx.drops.bad_tag
-        + rx.drops.wrong_ip
-        + rx.drops.old_seq
-        + rx.drops.old_tms
-        + rx.drops.identical;
-    (
-        recs,
-        PenStats {
-            accepted: 0, // filled by caller from recs.len()
-            dropped: (after - before) as u64,
-        },
-    )
+    dg: &[u8],
+    src: IpAddr,
+    key: &[u8; 32],
+    now: f64,
+) -> Vec<PenRecord> {
+    rx.accept(dg, &src.to_string(), key, now)
+}
+
+/// 100 ms ticker: lift a pen whose stream went silent (750 ms down /
+/// 1000 ms hover). Three repairs in a row without clean input auto-pause.
+pub async fn watchdog_task(app: Arc<App>) {
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        watchdog_tick(&app);
+    }
+}
+
+pub fn watchdog_tick(app: &App) {
+    let tripped = {
+        let mut hub = app.hub.lock_ok();
+        hub.active_mut().and_then(|a| a.rx.watchdog(now_secs()))
+    };
+    let Some(action) = tripped else {
+        return;
+    };
+    eprintln!("pen watchdog: {action} (stream went silent)");
+    app.injector.lock_ok().force_leave();
+    let paused = app.failsafe.lock_ok().note_stuck_trip().is_some();
+    if paused {
+        app.release_input("auto-pause");
+        banner("Pen auto-paused after repeated stuck input. Resume from the Chiz window.");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chiz_core::{derive_pen_key, encrypt_datagram};
+    use crate::app::testing;
+    use crate::store::PairedTablet;
+    use chiz_core::failsafe::PauseReason;
 
-    fn key() -> [u8; 32] {
-        let mut s = [0u8; 32];
-        for i in 0..32 {
-            s[i] = i as u8;
-        }
-        let mut salt = [0u8; 16];
-        for i in 0..16 {
-            salt[i] = 0xa0 + i as u8;
-        }
-        derive_pen_key(&s, &salt)
-    }
-
-    fn rec(phase: u8, t: u32) -> PenRecord {
+    fn rec(t: u32) -> PenRecord {
         PenRecord {
-            phase,
+            phase: 2,
             eraser: false,
             barrel1: false,
             barrel2: false,
@@ -90,26 +146,76 @@ mod tests {
         }
     }
 
-    #[test]
-    fn udp_accept_and_replay_counts() {
-        let k = key();
-        let mut rx = PenReceiver::new(7, "192.168.1.5");
-        let d1 = encrypt_datagram(&k, 7, 1, &[rec(0, 100)]);
-        let (r, s) = handle_datagram(&mut rx, &d1, "192.168.1.5", &k, 10.0);
-        assert_eq!(r.len(), 1);
-        assert_eq!(s.dropped, 0);
-        let (r2, s2) = handle_datagram(&mut rx, &d1, "192.168.1.5", &k, 10.1);
-        assert!(r2.is_empty());
-        assert_eq!(s2.dropped, 1); // replayed seq
+    /// An app with tablet "T" connected from 127.0.0.1; returns (sid, key).
+    fn connected() -> (std::sync::Arc<App>, u32, [u8; 32]) {
+        let app = testing::app();
+        let mut hub = app.hub.lock_ok();
+        hub.paired.insert(
+            "T",
+            PairedTablet {
+                secret: [4; 32],
+                name: "t".into(),
+            },
+        );
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let conn = hub.admit(ip, 0.0, false).unwrap();
+        let nonce = [1u8; 16];
+        let auth = chiz_core::compute_auth(&[4; 32], &nonce, "T");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let acc = hub
+            .hello(conn, "T", &auth, &nonce, ip, None, 0.0, tx)
+            .ok()
+            .unwrap();
+        let key = hub.active().unwrap().pen_key;
+        drop(hub);
+        (app, acc.sid, key)
+    }
+
+    fn highest(app: &App) -> u32 {
+        app.hub.lock_ok().active().unwrap().rx.highest_seq
     }
 
     #[test]
-    fn udp_wrong_ip_counted() {
-        let k = key();
-        let mut rx = PenReceiver::new(7, "192.168.1.5");
-        let d = encrypt_datagram(&k, 7, 1, &[rec(2, 100)]);
-        let (r, s) = handle_datagram(&mut rx, &d, "10.9.9.9", &k, 10.0);
-        assert!(r.is_empty());
-        assert_eq!(s.dropped, 1);
+    fn accepts_active_session_rejects_others() {
+        let (app, sid, key) = connected();
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        on_datagram(
+            &app,
+            &chiz_core::encrypt_datagram(&key, sid, 1, &[rec(10)]),
+            lo,
+        );
+        assert_eq!(highest(&app), 1);
+        // Wrong session id: ignored before decryption.
+        on_datagram(
+            &app,
+            &chiz_core::encrypt_datagram(&key, sid + 1, 2, &[rec(20)]),
+            lo,
+        );
+        assert_eq!(highest(&app), 1);
+        // Wrong source IP: counted as a drop.
+        let other: IpAddr = "10.0.0.9".parse().unwrap();
+        on_datagram(
+            &app,
+            &chiz_core::encrypt_datagram(&key, sid, 3, &[rec(30)]),
+            other,
+        );
+        assert_eq!(highest(&app), 1);
+        assert!(app.hub.lock_ok().active().unwrap().dropped() >= 1);
+        // Garbage never panics.
+        on_datagram(&app, &[1, 2, 3], lo);
+    }
+
+    #[test]
+    fn paused_pen_is_dropped() {
+        let (app, sid, key) = connected();
+        app.failsafe.lock_ok().pause(PauseReason::Manual);
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        on_datagram(
+            &app,
+            &chiz_core::encrypt_datagram(&key, sid, 1, &[rec(10)]),
+            lo,
+        );
+        assert_eq!(highest(&app), 0);
+        assert!(!app.failsafe.lock_ok().leave_pending);
     }
 }

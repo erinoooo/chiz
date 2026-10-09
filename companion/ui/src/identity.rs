@@ -78,7 +78,7 @@ pub fn load_or_generate(hostname: &str) -> Result<Identity, String> {
     load_or_generate_in(&data_dir(), hostname)
 }
 
-fn load_or_generate_in(dir: &Path, hostname: &str) -> Result<Identity, String> {
+pub(crate) fn load_or_generate_in(dir: &Path, hostname: &str) -> Result<Identity, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("data dir: {e}"))?;
     migrate_legacy(dir);
     let cert_path = dir.join("cert.der");
