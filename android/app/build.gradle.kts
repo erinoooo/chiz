@@ -16,10 +16,29 @@ android {
         versionName = "1.0.0"
     }
 
+    // Release signing comes from the environment (CI secrets / local shell);
+    // without it the release build is unsigned rather than debug-signed.
+    val ksPath = System.getenv("CHIZ_KEYSTORE")
+    signingConfigs {
+        if (ksPath != null) {
+            create("release") {
+                storeFile = file(ksPath)
+                storePassword = System.getenv("CHIZ_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("CHIZ_KEY_ALIAS")
+                keyPassword = System.getenv("CHIZ_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+            if (ksPath != null) signingConfig = signingConfigs.getByName("release")
         }
         debug {
             applicationIdSuffix = ".debug"

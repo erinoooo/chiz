@@ -255,23 +255,44 @@ class StripView @JvmOverloads constructor(
     }
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.5f * resources.displayMetrics.density
+    }
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
+        color = Color.parseColor("#ECECF1")
         textSize = 16 * resources.displayMetrics.scaledDensity
         textAlign = Paint.Align.CENTER
+        typeface = android.graphics.Typeface.create(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        paint.color = Color.parseColor("#141318")
+        val dp = resources.displayMetrics.density
+        paint.color = Color.parseColor("#0E0E12")
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
-        paint.color = if (connected) Color.parseColor("#4CAF50") else Color.parseColor("#F44336")
-        canvas.drawCircle(28 * resources.displayMetrics.density, headerH() / 2, 10f, paint)
+        // Connection light: green when the PC is reachable.
+        paint.color = if (connected) Color.parseColor("#4CC37A") else Color.parseColor("#F25C54")
+        canvas.drawCircle(28 * dp, headerH() / 2, 6 * dp, paint)
+        val inset = 5 * dp
+        val rad = 16 * dp
         for (b in buttons) {
             val r = cellRect(b)
-            paint.color = if (b.toggleOn) Color.parseColor("#3A6DF0") else Color.parseColor("#232329")
-            val rad = 12f
-            canvas.drawRoundRect(r.left + 4, r.top + 4, r.right - 4, r.bottom - 4, rad, rad, paint)
+            val l = r.left + inset
+            val t = r.top + inset
+            val rt = r.right - inset
+            val bt = r.bottom - inset
+            if (b.toggleOn) {
+                paint.color = Color.parseColor("#E8C547")
+                canvas.drawRoundRect(l, t, rt, bt, rad, rad, paint)
+                labelPaint.color = Color.parseColor("#1A1503")
+            } else {
+                paint.color = Color.parseColor("#1C1C23")
+                canvas.drawRoundRect(l, t, rt, bt, rad, rad, paint)
+                strokePaint.color = Color.parseColor("#2C2C36")
+                canvas.drawRoundRect(l, t, rt, bt, rad, rad, strokePaint)
+                labelPaint.color = Color.parseColor("#ECECF1")
+            }
             if (showLabels) {
                 canvas.drawText(b.label, r.centerX(), r.centerY() + labelPaint.textSize / 3, labelPaint)
             }

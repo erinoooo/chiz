@@ -152,8 +152,20 @@ class PenAreaView @JvmOverloads constructor(
             "buttons=${(if (r.barrel1) "B1" else "") + (if (r.barrel2) "B2" else "")} phase=${Phase.name(r.phase)}"
     }
 
+    private val areaPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+
     override fun onDraw(canvas: android.graphics.Canvas) {
         super.onDraw(canvas)
+        // Quiet dark surface with a thin frame so the active area is obvious
+        // without looking at it for long.
+        val dp = resources.displayMetrics.density
+        areaPaint.style = android.graphics.Paint.Style.FILL
+        areaPaint.color = android.graphics.Color.parseColor("#101015")
+        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), areaPaint)
+        areaPaint.style = android.graphics.Paint.Style.STROKE
+        areaPaint.strokeWidth = 2 * dp
+        areaPaint.color = android.graphics.Color.parseColor("#2C2C36")
+        canvas.drawRect(dp, dp, width - dp, height - dp, areaPaint)
         if (drawInk) canvas.drawPath(ink, inkPaint)
     }
 

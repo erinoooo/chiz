@@ -47,17 +47,20 @@ class AudioEngine(private val context: Context) {
             .setUsage(AudioAttributes.USAGE_GAME)
             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
             .build()
-        soundPool = SoundPool.Builder().setMaxStreams(4).setAudioAttributes(attrs).build()
+        val pool = SoundPool.Builder().setMaxStreams(4).setAudioAttributes(attrs).build()
+        soundPool = pool
         for (name in earconNames) {
             val id = context.resources.getIdentifier(name, "raw", context.packageName)
-            if (id != 0) earconIds[name] = soundPool!!.load(context, id, 1)
+            if (id != 0) earconIds[name] = pool.load(context, id, 1)
         }
         tts = TextToSpeech(context, { status ->
-            if (status == TextToSpeech.SUCCESS) {
+            // The engine may be released (stop()) before init completes.
+            val engine = tts
+            if (status == TextToSpeech.SUCCESS && engine != null) {
                 ttsReady = true
-                tts!!.setSpeechRate(speechRate)
+                engine.setSpeechRate(speechRate)
                 // Cache completions land in the pool; live speech otherwise.
-                tts!!.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(id: String?) {}
                     override fun onError(id: String?) {}
                     override fun onDone(id: String?) {
@@ -73,7 +76,7 @@ class AudioEngine(private val context: Context) {
                     override fun onError(id: String?, e: Int) {}
                 })
                 // Warm-up silent utterance (spec 7).
-                tts!!.speak("", TextToSpeech.QUEUE_FLUSH, null, "warmup")
+                engine.speak("", TextToSpeech.QUEUE_FLUSH, null, "warmup")
                 onTtsReady()
             }
         })

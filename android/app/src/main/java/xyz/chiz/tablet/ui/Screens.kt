@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -34,6 +35,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -148,29 +150,45 @@ fun IntroScreen(done: () -> Unit) {
         "Ears over eyes" to
             "Rest a finger on a strip button to hear its name; tap quickly to fire it. Your eyes stay on the monitor.",
         "Pair in seconds" to
-            "On the PC open Pair new tablet, then Scan QR here — or type the PIN on a network you trust.",
+            "On the PC open Pair new tablet, then Scan QR here, or type the PIN on a network you trust.",
     )
     val state = rememberPagerState(pageCount = { pages.size })
     val scope = rememberCoroutineScope()
-    Column(Modifier.fillMaxSize().padding(24.dp), Arrangement.Center) {
+    Column(Modifier.fillMaxSize().background(ChizColors.Bg).padding(32.dp), Arrangement.Center) {
         HorizontalPager(state, Modifier.weight(1f)) { i ->
             Column(Modifier.fillMaxSize(), Arrangement.Center) {
+                LogoMark(88.dp)
+                Spacer(Modifier.height(24.dp))
                 Text(pages[i].first, style = MaterialTheme.typography.headlineMedium)
-                Spacer(Modifier.height(12.dp))
-                Text(pages[i].second, style = MaterialTheme.typography.bodyLarge)
+                Spacer(Modifier.height(14.dp))
+                Text(
+                    pages[i].second,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = ChizColors.TextDim,
+                    modifier = Modifier.widthIn(max = 520.dp),
+                )
             }
         }
         Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-            Row {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 repeat(pages.size) { i ->
                     val on = i == state.currentPage
-                    Text(if (on) "● " else "○ ", color = if (on) MaterialTheme.colorScheme.primary else Color.Gray)
+                    Box(
+                        Modifier
+                            .height(8.dp)
+                            .width(if (on) 26.dp else 8.dp)
+                            .clip(CircleShape)
+                            .background(if (on) ChizColors.Amber else ChizColors.Border),
+                    )
                 }
             }
-            Button(onClick = {
-                if (state.currentPage < pages.size - 1) scope.launch { state.animateScrollToPage(state.currentPage + 1) }
-                else done()
-            }) { Text(if (state.currentPage < pages.size - 1) "Next" else "Start") }
+            Button(
+                onClick = {
+                    if (state.currentPage < pages.size - 1) scope.launch { state.animateScrollToPage(state.currentPage + 1) }
+                    else done()
+                },
+                contentPadding = PaddingValues(horizontal = 32.dp, vertical = 14.dp),
+            ) { Text(if (state.currentPage < pages.size - 1) "Next" else "Get started") }
         }
     }
 }
@@ -265,97 +283,121 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
         }
     }
 
-    Scaffold(
-        topBar = { TopAppBar(title = { Text("Chiz") }) },
-        floatingActionButton = {
-            ExtendedFloatingActionButton(
-                onClick = { sheet = "pin" },
-                icon = { Icon(Icons.Default.Add, null) },
-                text = { Text("Pair new PC") },
-            )
-        },
-    ) { pad ->
-        LazyColumn(Modifier.fillMaxSize().padding(pad).padding(16.dp)) {
+    Scaffold(containerColor = ChizColors.Bg) { pad ->
+        LazyColumn(
+            Modifier.fillMaxSize().padding(pad).padding(horizontal = 24.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            item { ChizHeader("Pair once, then draw.") }
             if (state.status == "connecting" || state.status == "reconnecting") {
-                item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+                item { LinearProgressIndicator(Modifier.fillMaxWidth().clip(CircleShape)) }
             }
             if (state.message.isNotEmpty()) {
                 item {
-                    Card(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                        Column(Modifier.padding(12.dp), Arrangement.spacedBy(8.dp)) {
-                            Text(state.message)
-                            // One-tap remediation for a rotated PC cert.
-                            val bad = paired.firstOrNull {
-                                state.mismatchHost.isNotEmpty() && state.mismatchHost in it.hosts
-                            }
-                            if (state.status == "error" && bad != null) {
-                                Button(onClick = {
-                                    scope.launch {
-                                        try {
-                                            store.save(paired.filter { it.pcId != bad.pcId })
-                                        } catch (e: Exception) {
-                                        }
-                                        paired = paired.filter { it.pcId != bad.pcId }
-                                    }
-                                }) { Text("Forget ${bad.name} and re-pair") }
-                            }
+                    val isError = state.status == "error"
+                    SectionCard {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            StatusDot(if (isError) ChizColors.Danger else ChizColors.Warn)
+                            Text(state.message, Modifier.weight(1f))
                         }
+                        // One-tap remediation for a rotated PC cert.
+                        val bad = paired.firstOrNull {
+                            state.mismatchHost.isNotEmpty() && state.mismatchHost in it.hosts
+                        }
+                        if (isError && bad != null) {
+                            Button(onClick = {
+                                scope.launch {
+                                    try {
+                                        store.save(paired.filter { it.pcId != bad.pcId })
+                                    } catch (e: Exception) {
+                                    }
+                                    paired = paired.filter { it.pcId != bad.pcId }
+                                }
+                            }) { Text("Forget ${bad.name} and re-pair") }
+                        }
+                    }
+                }
+            }
+            item { SectionLabel("Your PCs") }
+            if (paired.isEmpty()) {
+                item {
+                    SectionCard {
+                        Text("No PC paired yet", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "On your PC open Chiz and choose Pair new tablet, then scan the QR code here.",
+                            color = ChizColors.TextDim,
+                        )
                     }
                 }
             }
             items(paired, key = { it.pcId }) { pc ->
                 val addr = found.values.firstOrNull { (h, _) -> h in pc.hosts }
-                ElevatedCard(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
-                    Row(Modifier.fillMaxWidth().padding(12.dp), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-                        Column {
-                            Text(pc.name, style = MaterialTheme.typography.titleMedium)
-                            Text(
-                                if (addr != null) "found • ${addr.first}" else "not found",
-                                color = if (addr != null) Color(0xFF4CAF50) else Color.Gray,
-                            )
+                SectionCard {
+                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f), Arrangement.spacedBy(4.dp)) {
+                            Text(pc.name, style = MaterialTheme.typography.titleLarge)
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                StatusDot(if (addr != null) ChizColors.Go else ChizColors.TextDim, 8.dp)
+                                Text(
+                                    if (addr != null) "Found on your network" else "Not found right now",
+                                    color = if (addr != null) ChizColors.Go else ChizColors.TextDim,
+                                )
+                            }
                             // Fingerprint id: compare with the PC log's
                             // `cert fingerprint sha256:` on mismatch.
-                            Text("cert ${pc.fingerprintHex.take(8)}", color = Color.Gray)
+                            Text(
+                                "cert ${pc.fingerprintHex.take(8)}",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = ChizColors.TextDim,
+                            )
                         }
-                        Row {
-                            TextButton(onClick = {
-                                scope.launch {
-                                    val id = ctx.deviceId()
-                                    activity.svcState.value?.connect(
-                                        addr?.first ?: pc.hosts.firstOrNull() ?: return@launch,
-                                        47800, id,
-                                        PairInfo.Paired(pc.secretB64, hexToBytes(pc.fingerprintHex)),
-                                    )
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = {
+                            scope.launch {
+                                val id = ctx.deviceId()
+                                activity.svcState.value?.connect(
+                                    addr?.first ?: pc.hosts.firstOrNull() ?: return@launch,
+                                    47800, id,
+                                    PairInfo.Paired(pc.secretB64, hexToBytes(pc.fingerprintHex)),
+                                )
+                            }
+                        }) { Text("Connect") }
+                        TextButton(onClick = {
+                            val next = paired.filter { it.pcId != pc.pcId }
+                            scope.launch {
+                                try {
+                                    store.save(next)
+                                } catch (e: Exception) {
                                 }
-                            }) { Text("Connect") }
-                            TextButton(onClick = {
-                                val next = paired.filter { it.pcId != pc.pcId }
-                                scope.launch {
-                                    try {
-                                        store.save(next)
-                                    } catch (e: Exception) {
-                                    }
-                                    paired = next
-                                }
-                            }) { Text("Forget") }
-                        }
+                                paired = next
+                            }
+                        }) { Text("Forget", color = ChizColors.Danger) }
                     }
                 }
             }
+            item { SectionLabel("Add a PC") }
             item {
-                Row(Modifier.fillMaxWidth().padding(top = 8.dp), Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = {
-                        if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) ==
-                            PackageManager.PERMISSION_GRANTED
-                        ) {
-                            sheet = "qr"
-                        } else {
-                            cameraPerm.launch(Manifest.permission.CAMERA)
-                        }
-                    }) { Text("Scan QR") }
-                    OutlinedButton(onClick = { sheet = "manual" }) { Text("Manual address") }
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Button(
+                        onClick = {
+                            if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) ==
+                                PackageManager.PERMISSION_GRANTED
+                            ) {
+                                sheet = "qr"
+                            } else {
+                                cameraPerm.launch(Manifest.permission.CAMERA)
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth().height(54.dp),
+                    ) { Text("Scan QR code") }
+                    Row(Modifier.fillMaxWidth(), Arrangement.spacedBy(10.dp)) {
+                        OutlinedButton(onClick = { sheet = "pin" }, Modifier.weight(1f)) { Text("Pair with PIN") }
+                        OutlinedButton(onClick = { sheet = "manual" }, Modifier.weight(1f)) { Text("Manual address") }
+                    }
                 }
             }
+            item { Spacer(Modifier.height(24.dp)) }
         }
     }
 
@@ -637,13 +679,18 @@ fun DrawingScreen(activity: MainActivity, onSettings: () -> Unit, onTest: () -> 
 
     if (menu) {
         ModalBottomSheet(onDismissRequest = { menu = false }) {
-            Column(Modifier.fillMaxWidth().padding(16.dp), Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { menu = false; onSettings() }, Modifier.fillMaxWidth()) { Text("Settings") }
-                Button(onClick = { menu = false; onTest() }, Modifier.fillMaxWidth()) { Text("Pen test") }
+            Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp), Arrangement.spacedBy(10.dp)) {
+                OutlinedButton(onClick = { menu = false; onSettings() }, Modifier.fillMaxWidth().height(52.dp)) { Text("Settings") }
+                OutlinedButton(onClick = { menu = false; onTest() }, Modifier.fillMaxWidth().height(52.dp)) { Text("Pen test") }
                 Button(
                     onClick = { menu = false; svc?.disconnect("bye"); onDisconnect() },
-                    Modifier.fillMaxWidth(),
+                    Modifier.fillMaxWidth().height(52.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = ChizColors.Danger,
+                        contentColor = Color.White,
+                    ),
                 ) { Text("Disconnect") }
+                Spacer(Modifier.height(16.dp))
             }
         }
     }
@@ -651,23 +698,41 @@ fun DrawingScreen(activity: MainActivity, onSettings: () -> Unit, onTest: () -> 
 
 @Composable
 fun StatusOverlay(status: ConnState, profileName: String?, backOnce: Boolean, onMenu: () -> Unit) {
+    val dot = when (status.status) {
+        "connected" -> ChizColors.Go
+        "connecting", "reconnecting" -> ChizColors.Warn
+        else -> ChizColors.Danger
+    }
     Row(
-        Modifier.fillMaxWidth().padding(8.dp),
+        Modifier.fillMaxWidth().padding(10.dp),
         Arrangement.SpaceBetween,
         Alignment.CenterVertically,
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            val dot = when (status.status) {
-                "connected" -> Color(0xFF4CAF50)
-                "connecting", "reconnecting" -> Color(0xFFFFC107)
-                else -> Color(0xFFF44336)
-            }
-            Text("● ", color = dot)
-            Text(status.pcName.ifEmpty { status.status })
-            if (profileName != null) Text(" • $profileName", color = Color.Gray)
+        // Translucent pill so it never fights the drawing surface.
+        Row(
+            Modifier
+                .clip(CircleShape)
+                .background(ChizColors.Bg.copy(alpha = 0.72f))
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            StatusDot(dot, 9.dp)
+            Text(status.pcName.ifEmpty { status.status }, style = MaterialTheme.typography.labelLarge)
+            if (profileName != null) Text("· $profileName", color = ChizColors.TextDim, style = MaterialTheme.typography.labelLarge)
         }
         Row(verticalAlignment = Alignment.CenterVertically) {
-            if (backOnce) Text("Press back again to disconnect  ", color = Color.Yellow)
+            if (backOnce) {
+                Text(
+                    "Press back again to disconnect",
+                    color = ChizColors.Amber,
+                    style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(ChizColors.Bg.copy(alpha = 0.72f))
+                        .padding(horizontal = 14.dp, vertical = 8.dp),
+                )
+            }
             IconButton(onClick = onMenu) { Icon(Icons.Default.Menu, "Menu") }
         }
     }
@@ -720,64 +785,49 @@ fun SettingsScreen(back: () -> Unit) {
             it[SettingsKeys.AUTO_CONNECT] = autoConnect
         }
     }
-    Scaffold(topBar = {
-        TopAppBar(title = { Text("Settings") }, navigationIcon = {
-            IconButton(onClick = { save(); back() }) { Icon(Icons.Default.ArrowBack, "Back") }
-        })
-    }) { pad ->
-        LazyColumn(Modifier.fillMaxSize().padding(pad).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    Scaffold(
+        containerColor = ChizColors.Bg,
+        topBar = {
+            TopAppBar(
+                title = { Text("Settings") },
+                navigationIcon = {
+                    IconButton(onClick = { save(); back() }) { Icon(Icons.Default.ArrowBack, "Back") }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = ChizColors.Bg),
+            )
+        },
+    ) { pad ->
+        LazyColumn(
+            Modifier.fillMaxSize().padding(pad).padding(horizontal = 24.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            item { SectionLabel("Button strip") }
             item {
-                Text("Strip edge")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("left", "right", "top", "bottom").forEach { e ->
-                        FilterChip(e == edge, { edge = e; save() }, { Text(e) })
-                    }
+                SectionCard {
+                    ChipChoice("Edge", listOf("left", "right", "top", "bottom"), edge) { edge = it; save() }
+                    SettingSlider("Size", "${size.toInt()}%", size, { size = it; save() }, 10f..35f)
+                    SettingSwitch("Show button labels", null, labels) { labels = it; save() }
+                    SettingSwitch("Button guard", "Ignore strip touches while the pen is near", guard) { guard = it; save() }
                 }
             }
+            item { SectionLabel("Feedback") }
             item {
-                Text("Strip size: ${size.toInt()}% of shorter side")
-                Slider(size, { size = it; save() }, valueRange = 10f..35f)
-            }
-            item { Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-                Text("Button guard"); Switch(guard, { guard = it; save() })
-            } }
-            item { Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-                Text("Dim screen when idle"); Switch(dim, { dim = it; save() })
-            } }
-            item {
-                Text("Feedback")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("both", "earcons", "speech", "off").forEach { f ->
-                        FilterChip(f == feedback, { feedback = f; save() }, { Text(f) })
-                    }
+                SectionCard {
+                    ChipChoice("Mode", listOf("both", "earcons", "speech", "off"), feedback) { feedback = it; save() }
+                    SettingSlider("Speech rate", "${"%.1f".format(rate)}x", rate, { rate = it; save() }, 0.5f..4.0f)
+                    SettingSlider("Volume", "${volume.toInt()}%", volume, { volume = it; save() }, 0f..100f)
+                    ChipChoice("Announce on", listOf("rest", "touch"), announce) { announce = it; save() }
+                    SettingSlider("Rest delay", "${rest.toInt()} ms", rest, { rest = it; save() }, 150f..600f)
                 }
             }
+            item { SectionLabel("General") }
             item {
-                Text("Speech rate: ${"%.1f".format(rate)}x")
-                Slider(rate, { rate = it; save() }, valueRange = 0.5f..4.0f)
-            }
-            item {
-                Text("Feedback volume: ${volume.toInt()}%")
-                Slider(volume, { volume = it; save() }, valueRange = 0f..100f)
-            }
-            item {
-                Text("Announce mode")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("rest", "touch").forEach { a ->
-                        FilterChip(a == announce, { announce = a; save() }, { Text(a) })
-                    }
+                SectionCard {
+                    SettingSwitch("Dim screen when idle", null, dim) { dim = it; save() }
+                    SettingSwitch("Auto-connect last PC", "Reconnect as soon as it is found", autoConnect) { autoConnect = it; save() }
                 }
             }
-            item {
-                Text("Rest delay: ${rest.toInt()} ms")
-                Slider(rest, { rest = it; save() }, valueRange = 150f..600f)
-            }
-            item { Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-                Text("Show button labels"); Switch(labels, { labels = it; save() })
-            } }
-            item { Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-                Text("Auto-connect last PC"); Switch(autoConnect, { autoConnect = it; save() })
-            } }
+            item { Spacer(Modifier.height(24.dp)) }
         }
     }
 }
@@ -788,14 +838,23 @@ fun SettingsScreen(back: () -> Unit) {
 fun TestScreen(back: () -> Unit) {
     // Local only: live readout + ink trail, nothing sent to the PC.
     var readout by remember { mutableStateOf("waiting for pen…") }
-    Scaffold(topBar = {
-        TopAppBar(title = { Text("Pen test") }, navigationIcon = {
-            IconButton(onClick = back) { Icon(Icons.Default.ArrowBack, "Back") }
-        })
-    }) { pad ->
-        Column(Modifier.fillMaxSize().padding(pad).padding(16.dp)) {
-            Text(readout, style = MaterialTheme.typography.bodyLarge)
-            Spacer(Modifier.height(8.dp))
+    Scaffold(
+        containerColor = ChizColors.Bg,
+        topBar = {
+            TopAppBar(
+                title = { Text("Pen test") },
+                navigationIcon = {
+                    IconButton(onClick = back) { Icon(Icons.Default.ArrowBack, "Back") }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = ChizColors.Bg),
+            )
+        },
+    ) { pad ->
+        Column(Modifier.fillMaxSize().padding(pad).padding(horizontal = 24.dp, vertical = 8.dp)) {
+            SectionCard {
+                Text(readout, style = MaterialTheme.typography.bodyLarge)
+            }
+            Spacer(Modifier.height(12.dp))
             AndroidView(
                 factory = { c ->
                     xyz.chiz.tablet.ui.PenAreaView(c).apply {
@@ -803,7 +862,10 @@ fun TestScreen(back: () -> Unit) {
                         drawInk = true
                     }
                 },
-                modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(MaterialTheme.shapes.large)
+                    .background(ChizColors.Surface),
             )
         }
     }

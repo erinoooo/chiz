@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Earcons are loaded by name via getIdentifier(); keep them through resource shrinking. -->
+<resources xmlns:tools="http://schemas.android.com/tools" tools:keep="@raw/*" />
