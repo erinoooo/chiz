@@ -33,20 +33,29 @@ class PenSender(
     private val queue = ArrayBlockingQueue<List<PenRecord>>(64)
     private val running = AtomicBoolean(true)
     private var seq: Long = 0
-    private var inRange = false
+    @Volatile private var inRange = false
     private val sock = DatagramSocket().apply { connect(host, port) }
 
     private val thread = Thread({
         var lastSend = SystemClock.uptimeMillis()
         while (running.get()) {
-            val batch = queue.poll(50, java.util.concurrent.TimeUnit.MILLISECONDS)
-            val now = SystemClock.uptimeMillis()
-            if (batch != null) {
-                sendBatch(batch)
-                lastSend = now
-            } else if (inRange && now - lastSend >= 250) {
-                sendBatch(emptyList()) // heartbeat
-                lastSend = now
+            try {
+                val batch = queue.poll(50, java.util.concurrent.TimeUnit.MILLISECONDS)
+                val now = SystemClock.uptimeMillis()
+                if (batch != null) {
+                    sendBatch(batch)
+                    lastSend = now
+                } else if (inRange && now - lastSend >= 250) {
+                    sendBatch(emptyList()) // heartbeat
+                    lastSend = now
+                }
+            } catch (e: InterruptedException) {
+                return@Thread
+            } catch (e: java.io.IOException) {
+                // A Wi-Fi blip or a closed socket: drop this batch and keep
+                // going (an uncaught exception here would kill the whole app;
+                // UDP loss is already repaired by the PC's watchdog).
+                if (!running.get()) return@Thread
             }
         }
     }, "chiz-pen-sender").apply { isDaemon = true; start() }

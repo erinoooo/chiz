@@ -205,6 +205,7 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
     var state by remember { mutableStateOf(ConnState()) }
     var autoTried by remember { mutableStateOf(false) }
     var saveFailed by remember { mutableStateOf(false) }
+    var manualAddr by remember { mutableStateOf<Pair<String, Int>?>(null) }
     val store = remember { PairingStore(ctx) }
     val discovery = remember {
         Discovery(ctx) { name, host, port -> found = found + (name to (host to port)) }
@@ -234,8 +235,8 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
         val pc = paired.firstOrNull { lastHost in it.hosts } ?: return@LaunchedEffect
         autoTried = true
         val id = ctx.deviceId()
-        activity.svcState.value?.connect(
-            lastHost, lastPort, id,
+        activity.svcState.value?.connectHosts(
+            listOf(lastHost) + pc.hosts, lastPort, id,
             PairInfo.Paired(pc.secretB64, hexToBytes(pc.fingerprintHex)),
         )
     }
@@ -363,9 +364,9 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
                         Button(onClick = {
                             scope.launch {
                                 val id = ctx.deviceId()
-                                activity.svcState.value?.connect(
-                                    addr?.first ?: pc.hosts.firstOrNull() ?: return@launch,
-                                    47800, id,
+                                activity.svcState.value?.connectHosts(
+                                    listOfNotNull(addr?.first) + pc.hosts,
+                                    addr?.second ?: pc.port(), id,
                                     PairInfo.Paired(pc.secretB64, hexToBytes(pc.fingerprintHex)),
                                 )
                             }
@@ -436,25 +437,27 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
         )
         "pin" -> PinSheet(
             found = found,
+            preset = manualAddr,
             attemptsLeft = state.attemptsLeft,
             onPick = { host, port, pin ->
                 sheet = null
+                manualAddr = null
                 scope.launch {
                     val id = ctx.deviceId()
                     activity.svcState.value?.connect(host, port, id, PairInfo.Pin(pin))
                 }
             },
-            onDismiss = { sheet = null },
+            onDismiss = {
+                sheet = null
+                manualAddr = null
+            },
         )
         "manual" -> ManualSheet(
             onPick = { host, port ->
-                sheet = null
-                scope.launch {
-                    val id = ctx.deviceId()
-                    // Manual entry still needs a pairing mode; default to PIN
-                    // entry against the typed address.
-                    activity.svcState.value?.connect(host, port, id, PairInfo.Pin(""))
-                }
+                // A typed address still needs proof of trust: continue with
+                // PIN pairing against it (an empty PIN can never succeed).
+                manualAddr = host to port
+                sheet = "pin"
             },
             onDismiss = { sheet = null },
         )
@@ -464,12 +467,14 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
 @Composable
 fun PinSheet(
     found: Map<String, Pair<String, Int>>,
+    preset: Pair<String, Int>?,
     attemptsLeft: Int,
     onPick: (String, Int, String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var host by remember { mutableStateOf(found.values.firstOrNull()?.first ?: "") }
-    var port by remember { mutableStateOf(found.values.firstOrNull()?.second?.toString() ?: "47800") }
+    val initial = preset ?: found.values.firstOrNull()
+    var host by remember { mutableStateOf(initial?.first ?: "") }
+    var port by remember { mutableStateOf(initial?.second?.toString() ?: "47800") }
     var pin by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -507,12 +512,15 @@ fun ManualSheet(onPick: (String, Int) -> Unit, onDismiss: () -> Unit) {
         },
         confirmButton = {
             TextButton(onClick = { onPick(host, port.toIntOrNull() ?: 47800) }, enabled = host.isNotBlank()) {
-                Text("Connect")
+                Text("Next")
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
+
+/** Port stored in the record id (`host:port`). */
+private fun PairedPc.port(): Int = pcId.substringAfterLast(':').toIntOrNull() ?: 47800
 
 /** Persist the list without the forgotten PC, and forget where we last were. */
 private suspend fun forgetPc(ctx: Context, store: PairingStore, remaining: List<PairedPc>): Boolean {
@@ -572,7 +580,11 @@ fun DrawingScreen(activity: MainActivity, onSettings: () -> Unit, onTest: () -> 
         launch {
             svc.state.collect {
                 status = it
-                if (it.status == "disconnected" && it.message == "panic disconnect") onDisconnect()
+                // Panic, or a failure retrying cannot fix (forgotten on the PC,
+                // replaced, certificate changed): show it on the connect screen.
+                if ((it.status == "disconnected" && it.message == "panic disconnect") || it.status == "error") {
+                    onDisconnect()
+                }
             }
         }
     }

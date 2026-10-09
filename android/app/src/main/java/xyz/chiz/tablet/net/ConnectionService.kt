@@ -10,10 +10,11 @@ import android.content.Intent
 import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
-import android.util.Base64
 import androidx.core.app.NotificationCompat
 import androidx.datastore.preferences.core.edit
 import kotlinx.coroutines.CoroutineScope
@@ -28,56 +29,46 @@ import kotlinx.coroutines.launch
 import org.json.JSONObject
 import xyz.chiz.tablet.proto.PanicGesture
 import xyz.chiz.tablet.proto.StripProfile
-import xyz.chiz.tablet.proto.computeAuth
-import xyz.chiz.tablet.proto.constTimeEqual
-import xyz.chiz.tablet.proto.computePinProof
-import xyz.chiz.tablet.proto.derivePenKey
 import xyz.chiz.tablet.proto.parseStripProfile
-import xyz.chiz.tablet.proto.pinMatches
 import xyz.chiz.tablet.proto.toHex
-import xyz.chiz.tablet.proto.reconnectDelay
+import xyz.chiz.tablet.ui.MainActivity
+import xyz.chiz.tablet.ui.PenAreaView
 import xyz.chiz.tablet.ui.SettingsKeys
 import xyz.chiz.tablet.ui.settingsStore
-import xyz.chiz.tablet.ui.MainActivity
 import java.net.InetAddress
-import java.security.MessageDigest
-import java.util.UUID
+import java.util.Base64
 
-/** Connection status for the UI. */
+/** Connection status for the UI (derived from [LinkState]). */
 data class ConnState(
     val status: String = "disconnected", // disconnected|connecting|reconnecting|connected|error
     val pcName: String = "",
     val message: String = "",
-    val pairingOpen: Boolean = false,
     val attemptsLeft: Int = 5,
-    /** Host whose cert just mismatched: auto-connect must skip it. */
+    /** Host whose certificate mismatched: auto-connect must skip it. */
     val mismatchHost: String = "",
 )
 
-/** How this tablet will prove itself. Set by the UI before connect(). */
+/** How this tablet will prove itself; built by the UI before connecting. */
 sealed interface PairInfo {
-    data class Paired(val secretB64: String, val pinnedFp: ByteArray) : PairInfo
-    data class Qr(val hosts: List<String>, val port: Int, val tokenB64: String, val pinnedFp: ByteArray) : PairInfo
-    data class Pin(val pin: String) : PairInfo // fp captured from TLS, proof binds it
+    class Paired(val secretB64: String, val pinnedFp: ByteArray) : PairInfo
+    class Qr(val hosts: List<String>, val port: Int, val tokenB64: String, val pinnedFp: ByteArray) : PairInfo
+    class Pin(val pin: String) : PairInfo
 }
 
-/** Permanent TLS identity failure: retrying can never succeed. */
-class CertMismatch(msg: String) : Exception(msg)
-
-fun fpShort(fp: ByteArray): String = fp.joinToString("") { "%02x".format(it) }.take(8)
-
 /**
- * Foreground service (type connectedDevice) owning the control socket, pen
- * sender and audio engine, so rotation never drops the session (spec 6).
- * Full handshake: challenge → pair_request/hello → welcome → profile, with
- * the 0.5/1/2/4s→5s reconnect schedule and a 5 s panic cooldown.
+ * Foreground service (type connectedDevice) that keeps the session alive
+ * across rotation and screen changes (spec 6). All networking lives in
+ * [Connector]; this class adapts it to Android: pen sender, Wi-Fi/wake
+ * locks, audio feedback, pairing storage and the notification.
  */
-class ConnectionService : Service() {
+class ConnectionService : Service(), ConnectorHost {
     inner class LocalBinder(val service: ConnectionService) : Binder()
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var wifiLock: WifiManager.WifiLock? = null
-    private var wakeLock: PowerManager.WakeLock? = null
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val main = Handler(Looper.getMainLooper())
+    private val connector by lazy { Connector(scope, this) }
+    private val pairingStore by lazy { PairingStore(this) }
+    val audio: AudioEngine by lazy { AudioEngine(this) }
 
     private val _state = MutableStateFlow(ConnState())
     val state: StateFlow<ConnState> = _state
@@ -85,44 +76,26 @@ class ConnectionService : Service() {
     val profile: StateFlow<StripProfile?> = _profile
     private val _toggleStates = MutableStateFlow<Map<String, Boolean>>(emptyMap())
     val toggleStates: StateFlow<Map<String, Boolean>> = _toggleStates
-    private val pairingStore by lazy { PairingStore(this) }
     private val _pairingsVersion = MutableStateFlow(0)
-    /** Incremented every time the pairing store changes; UI reloads on it. */
+    /** Incremented whenever the pairing store changes; the UI reloads on it. */
     val pairingsVersion: StateFlow<Int> = _pairingsVersion
 
-    val audio: AudioEngine by lazy { AudioEngine(this) }
+    val rttMs: Double get() = connector.rttMs.toDouble()
 
-    private var control: ControlChannel? = null
-    private var sender: PenSender? = null
-    private var discovery: Discovery? = null
-    private var connectJob: Job? = null
+    @Volatile private var sender: PenSender? = null
+    private var penView: PenAreaView? = null // main thread only
+    @Volatile private var surface = 2100 to 1600
+    @Volatile private var panicUntil = 0L
+    @Volatile private var note = "" // shown while idle (e.g. "panic disconnect")
+    @Volatile private var lastPcName = ""
+    @Volatile private var muted = false
     private var muteJob: Job? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
-    // Handshake state (reader-thread confined, @Volatile for UI reads).
-    @Volatile private var phase = "idle"
-    @Volatile private var nonce = ByteArray(0)
-    @Volatile private var deviceId = ""
-    @Volatile private var secretB64 = ""
-    @Volatile private var penPort = 47801
-    @Volatile private var sessionId = 0L
-    @Volatile private var hostAddr = ""
-    @Volatile private var pcNameSeen = ""
-    @Volatile private var portSeen = 47800
-    @Volatile private var surfaceW = 2100
-    @Volatile private var surfaceH = 1600
-    private var penView: xyz.chiz.tablet.ui.PenAreaView? = null
-
-    /** Drawing screen hands over its pen view; the session sender attaches
-     * on welcome (and detaches on teardown), so strokes always flow. */
-    fun registerPenView(v: xyz.chiz.tablet.ui.PenAreaView?) {
-        penView = v
-        v?.sender = sender
-    }
-    private var pairInfo: PairInfo? = null
-    private var wantStop = false
-    private var panicUntil = 0L
-    private val pingSent = mutableMapOf<Int, Long>()
-    @Volatile var rttMs = 0.0
+    @Volatile override var deviceId: String = ""
+        private set
+    override val deviceName: String = Build.MODEL ?: "Android tablet"
 
     override fun onBind(intent: Intent?): IBinder = LocalBinder(this)
 
@@ -130,359 +103,183 @@ class ConnectionService : Service() {
         super.onCreate()
         createChannel()
         audio.start {}
+        scope.launch { connector.state.collect { render(it) } }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == "DISCONNECT") {
+        if (intent?.action == ACTION_DISCONNECT) {
             disconnect("bye")
             stopSelf()
             return START_NOT_STICKY
         }
         startForeground(
             1,
-            notification("Connecting…"),
+            notification("Not connected"),
             android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
         )
         return START_STICKY
     }
 
-    // ------------------------------------------------------------ connect
+    override fun onDestroy() {
+        connector.stop(bye = true)
+        sender?.stop()
+        releaseLocks()
+        audio.stop()
+        scope.cancel()
+        super.onDestroy()
+    }
+
+    // ------------------------------------------------------------ UI API
 
     fun isPanicCooldown(): Boolean = SystemClock.uptimeMillis() < panicUntil
 
-    fun connect(host: String, port: Int, deviceIdIn: String, info: PairInfo) {
+    fun connect(host: String, port: Int, deviceIdIn: String, info: PairInfo) =
         connectHosts(listOf(host), port, deviceIdIn, info)
-    }
 
-    /** Multi-host connect (QR lists): tries each address in order. */
+    /** Connect (or pair) trying [hosts] in order. Replaces any running attempt. */
     fun connectHosts(hosts: List<String>, port: Int, deviceIdIn: String, info: PairInfo) {
         if (isPanicCooldown()) {
-            _state.value = ConnState("error", "", "Panic cooldown: wait 5 s")
+            _state.value = ConnState("error", "", "Panic cooldown: wait a few seconds.")
             return
         }
-        disconnect("")
-        wantStop = false
+        val addrs = hosts.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (addrs.isEmpty()) {
+            _state.value = ConnState("error", "", "No address to connect to.")
+            return
+        }
         deviceId = deviceIdIn
-        pairInfo = info
-        _state.value = ConnState("connecting", hosts.firstOrNull() ?: "", "")
-        hostAddr = hosts.firstOrNull() ?: ""
-        portSeen = port
-        connectJob = scope.launch {
-            var attempt = 0
-            while (!wantStop && _state.value.status != "connected") {
-                try {
-                    runSession(hosts, port)
-                    return@launch
-                } catch (e: StopLoop) {
-                    return@launch // clean disconnect / fatal error: no retry
-                } catch (e: CertMismatch) {
-                    _state.value = ConnState("error", "", e.message ?: "certificate mismatch", mismatchHost = hostAddr)
-                    wantStop = true
-                    return@launch // permanent: never hammer a wrong cert
-                } catch (e: Exception) {
-                    _state.value = ConnState("reconnecting", hostAddr, e.message ?: "connection failed")
-                    delay((reconnectDelay(attempt++) * 1000).toLong())
-                }
-            }
+        note = ""
+        connector.start(Target(addrs, port, info.toAuth()))
+    }
+
+    /** User-initiated disconnect: the PC is told (`bye`). */
+    fun disconnect(reason: String) {
+        note = if (reason == "bye") "" else reason
+        connector.stop(bye = true)
+    }
+
+    /** Tablet panic gesture: stop the pen stream first, then bye, then a cooldown. */
+    fun panicDisconnect() {
+        sender?.stop()
+        panicUntil = SystemClock.uptimeMillis() + PanicGesture.RECONNECT_COOLDOWN_MS
+        note = "panic disconnect"
+        connector.stop(bye = true)
+    }
+
+    /** After the user forgets a PC: drop a stale error banner. */
+    fun clearError() {
+        if (_state.value.status == "error") {
+            note = ""
+            connector.stop(bye = false)
         }
     }
 
-    private class StopLoop : Exception()
-
-    /** One session attempt: TLS + challenge; the message callbacks drive it.
-     * After `welcome` this parks until the transport dies or a clean stop,
-     * so mid-session drops reconnect instead of silently ending.
-     * QR lists are tried in order, 2 s each (spec 3). */
-    private fun runSession(hosts: List<String>, port: Int) {
-        val info = pairInfo ?: throw StopLoop()
-        val pinned: ByteArray? = when (info) {
-            is PairInfo.Paired -> info.pinnedFp
-            is PairInfo.Qr -> info.pinnedFp
-            is PairInfo.Pin -> null // capture observed fp for the proof
-        }
-        if (info is PairInfo.Paired) secretB64 = info.secretB64
-        var lastErr: Exception? = null
-        var mismatch: CertMismatch? = null
-        var mismatchAt = ""
-        for (host in hosts) {
-            if (wantStop) throw StopLoop()
-            hostAddr = host
-            phase = "wait_challenge"
-            armDeadline()
-            val ch = ControlChannel(host, port, pinned, ::onControlMessage, ::onDead) {
-                pingSent[it] = SystemClock.uptimeMillis()
-            }
-            ch.connectTimeoutMs = 2000
-            try {
-                ch.connect()
-            } catch (e: Exception) {
-                if (e.message?.contains("fingerprint mismatch") == true ||
-                    e.cause?.message?.contains("fingerprint mismatch") == true
-                ) {
-                    // Another machine (or a stale entry) may own this address;
-                    // keep trying the rest of the list before giving up.
-                    val want = pinned?.let { fpShort(it) } ?: "?"
-                    val got = ch.observedFp?.let { fpShort(it) } ?: "?"
-                    if (mismatch == null) {
-                        mismatch = CertMismatch(
-                            "Certificate mismatch at $host (tablet expects $want, the device " +
-                                "there showed $got). Check the Tablets page on the PC: its " +
-                                "certificate id must be $want. Otherwise forget this PC and pair again.",
-                        )
-                        mismatchAt = host
-                    }
-                    lastErr = mismatch
-                    continue
-                }
-                lastErr = Exception("connect $host failed: ${e.message}")
-                continue
-            }
-            control = ch
-            holdLocks()
-            while (!wantStop && phase != "dead") {
-                if (phase != "connected" && SystemClock.uptimeMillis() > connectDeadline()) {
-                    control?.close()
-                    lastErr = Exception("handshake timeout")
-                    break
-                }
-                Thread.sleep(200)
-            }
-            if (wantStop) throw StopLoop()
-            // Dead transport (mid-session drop or pre-welcome loss):
-            // retry with the next host, then the whole list.
-            lastErr = Exception("connection lost (${ch.deathReason.ifEmpty { "unknown" }})")
-        }
-        mismatch?.let {
-            hostAddr = mismatchAt
-            throw it
-        }
-        throw lastErr ?: Exception("no route to PC")
+    fun sendButton(id: String, phase: String) {
+        connector.send(JSONObject().put("t", "button").put("id", id).put("phase", phase).toString())
     }
 
-    @Volatile private var deadlineAt = 0L
-    private fun connectDeadline(): Long = deadlineAt
-
-    private fun armDeadline() {
-        deadlineAt = SystemClock.uptimeMillis() + 15000
+    fun sendSurface(w: Int, h: Int) {
+        if (w <= 0 || h <= 0) return
+        surface = w to h
+        connector.send(JSONObject().put("t", "surface").put("w", w).put("h", h).toString())
     }
 
-    private fun onDead() {
+    /** The drawing screen hands over its pen view (main thread). */
+    fun registerPenView(v: PenAreaView?) {
+        penView = v
+        v?.sender = sender
+    }
+
+    // ------------------------------------------------------------ ConnectorHost
+
+    override fun penArea(): Pair<Int, Int> = surface
+
+    override suspend fun savePairing(host: String, port: Int, pcName: String, fingerprint: ByteArray, secret: ByteArray) {
+        val fpHex = fingerprint.toHex()
+        val rec = PairedPc(
+            pcId = "$host:$port",
+            name = pcName.ifEmpty { host },
+            fingerprintHex = fpHex,
+            secretB64 = Base64.getEncoder().encodeToString(secret),
+            hosts = listOf(host),
+        )
+        try {
+            // A re-pair REPLACES any record for the same PC (id, address or certificate).
+            val others = pairingStore.load().filter {
+                it.pcId != rec.pcId && host !in it.hosts && it.fingerprintHex != fpHex
+            }
+            pairingStore.save(listOf(rec) + others)
+            _pairingsVersion.value += 1
+        } catch (e: Exception) {
+            note = "Paired, but saving the pairing failed: ${e.message}"
+        }
+    }
+
+    override suspend fun repairPin(stale: ByteArray, actual: ByteArray) {
+        val staleHex = stale.toHex()
+        try {
+            val fixed = pairingStore.load().map {
+                if (it.fingerprintHex == staleHex) it.copy(fingerprintHex = actual.toHex()) else it
+            }
+            pairingStore.save(fixed)
+            _pairingsVersion.value += 1
+        } catch (e: Exception) {
+            // Harmless: the legacy form keeps working and is repaired next time.
+        }
+    }
+
+    override fun onConnected(info: SessionInfo) {
+        lastPcName = info.pcName
+        val s = PenSender(
+            InetAddress.getByName(info.host), info.penPort, info.sessionId, info.penKey,
+            // Rare (2^32 datagrams): start a fresh session before seq wraps (spec 5).
+            onSeqRollover = { connector.send("""{"t":"bye"}""") },
+        )
+        sender = s
+        main.post {
+            penView?.sender = s
+            penView?.newSession()
+        }
+        holdLocks()
+        scope.launch {
+            applicationContext.settingsStore.edit {
+                it[SettingsKeys.LAST_HOST] = info.host
+                it[SettingsKeys.LAST_PORT] = info.port
+            }
+        }
+        audio.earcon("connect")
+        audio.speak("Connected to ${info.pcName}")
+        startMuteWatch()
+    }
+
+    override fun onSessionEnded(reason: String) {
         sender?.stop()
         sender = null
-        penView?.sender = null
+        main.post { penView?.sender = null }
         releaseLocks()
-        phase = "dead" // runSession's waiter retries; live sessions reconnect
-        if (!wantStop && _state.value.status == "connected") {
-            _state.value = _state.value.copy(
-                status = "reconnecting",
-                message = "connection lost (${control?.deathReason?.ifEmpty { null } ?: "unknown"})",
-            )
-            audio.speak("Disconnected")
-            audio.earcon("disconnect")
-        }
+        muteJob?.cancel()
+        _toggleStates.value = emptyMap()
+        audio.earcon("disconnect")
+        audio.speak("Disconnected")
     }
 
-    // ------------------------------------------------------------ dispatch
-
-    private fun onControlMessage(json: String) {
-        val o = try {
-            JSONObject(json)
-        } catch (e: Exception) {
-            return // unknown/unparseable: ignore per spec
-        }
-        when (o.optString("t", "")) {
-            "challenge" -> onChallenge(o)
-            "welcome" -> onWelcome(o)
-            "pair_ok" -> onPairOk(o)
-            "pair_fail" -> {
-                _state.value = _state.value.copy(
-                    attemptsLeft = o.optInt("attempts_left", 0),
-                    message = "Pairing failed: ${o.optString("code", "")}",
-                )
-            }
-            "profile" -> onProfile(o)
+    override fun onMessage(msg: JSONObject) {
+        when (msg.optString("t")) {
+            "profile" -> onProfile(msg)
             "button_state" -> {
-                val id = o.optString("id", "")
-                val on = o.optBoolean("on", false)
+                val id = msg.optString("id")
+                val on = msg.optBoolean("on")
                 _toggleStates.value = _toggleStates.value + (id to on)
                 val label = _profile.value?.button(id)?.let { it.speak.ifEmpty { it.label } } ?: id
                 audio.speak("$label ${if (on) "on" else "off"}")
                 audio.earcon(if (on) "on" else "off")
             }
-            "speak" -> audio.speak(o.optString("text", ""))
-            "pong" -> {
-                val sent = pingSent.remove(o.optInt("id", -1))
-                if (sent != null) rttMs = (SystemClock.uptimeMillis() - sent).toDouble()
-            }
-            "error" -> {
-                _state.value = ConnState("error", _state.value.pcName, o.optString("message", o.optString("code", "")))
-                phase = "dead"
-                wantStop = true // not_paired/busy: don't hammer
-            }
-            "bye" -> {
-                wantStop = true
-                phase = "dead"
-            }
-            else -> {} // unknown types ignored per spec
+            "speak" -> audio.speak(msg.optString("text"))
         }
-    }
-
-    private fun onChallenge(o: JSONObject) {
-        _state.value = _state.value.copy(pairingOpen = o.optBoolean("pairing_open", false))
-        pcNameSeen = o.optString("pc_name", "")
-        nonce = Base64.decode(o.getString("nonce"), Base64.DEFAULT)
-        when (val info = pairInfo) {
-            is PairInfo.Paired -> {
-                val auth = computeAuth(b64(secretB64), nonce, deviceId)
-                control?.send(
-                    JSONObject().apply {
-                        put("t", "hello")
-                        put("proto", 1)
-                        put("device_id", deviceId)
-                        put("device_name", android.os.Build.MODEL)
-                        put("app_version", "1.0.0")
-                        put("auth", auth)
-                        put("caps", JSONObject().apply {
-                            put("pressure", true); put("tilt", true); put("hover", true)
-                            put("eraser", true); put("barrel", 2); put("video", false)
-                        })
-                        // pen_area ratio is refreshed by later `surface` msgs.
-                        put("pen_area", JSONObject().apply { put("w", surfaceW); put("h", surfaceH) })
-                    }.toString(),
-                )
-                phase = "wait_welcome"
-            }
-            is PairInfo.Qr -> {
-                control?.send(
-                    JSONObject().apply {
-                        put("t", "pair_request")
-                        put("proto", 1)
-                        put("device_id", deviceId)
-                        put("device_name", android.os.Build.MODEL)
-                        put("mode", "qr")
-                        put("token", info.tokenB64)
-                    }.toString(),
-                )
-                phase = "wait_pair"
-            }
-            is PairInfo.Pin -> {
-                val observed = control?.observedFp
-                if (observed == null) {
-                    _state.value = _state.value.copy(message = "no certificate observed")
-                    return
-                }
-                val proof = computePinProof(info.pin, observed, nonce, deviceId)
-                control?.send(
-                    JSONObject().apply {
-                        put("t", "pair_request")
-                        put("proto", 1)
-                        put("device_id", deviceId)
-                        put("device_name", android.os.Build.MODEL)
-                        put("mode", "pin")
-                        put("proof", proof)
-                    }.toString(),
-                )
-                phase = "wait_pair"
-            }
-            null -> {}
-        }
-    }
-
-    private fun onPairOk(o: JSONObject) {
-        secretB64 = o.getString("device_secret")
-        // Persist NOW (spec 11): otherwise the next app start has no secret
-        // and the tablet begs to pair again while the PC looks paired.
-        scope.launch {
-            try {
-                val fpHex = when (val info = pairInfo) {
-                    // Both values are already SHA-256(cert). Hashing them again
-                    // (the old fpHex) made every later reconnect "mismatch".
-                    is PairInfo.Qr -> info.pinnedFp.toHex()
-                    is PairInfo.Pin -> control?.observedFp?.toHex() ?: ""
-                    else -> ""
-                }
-                val rec = PairedPc(
-                    pcId = "$hostAddr:$portSeen",
-                    name = pcNameSeen.ifEmpty { hostAddr },
-                    fingerprintHex = fpHex,
-                    secretB64 = secretB64,
-                    hosts = listOf(hostAddr),
-                )
-                // A re-pair must REPLACE the old record for this PC. Keeping the
-                // stale one (old fingerprint, same host:port) made every later
-                // connect pin the dead certificate: permanent "mismatch".
-                val cur = pairingStore.load().filter {
-                    it.pcId != rec.pcId &&
-                        hostAddr !in it.hosts &&
-                        (fpHex.isEmpty() || it.fingerprintHex != fpHex)
-                }
-                pairingStore.save(listOf(rec) + cur)
-                _pairingsVersion.value += 1
-            } catch (e: Exception) {
-                _state.value = _state.value.copy(message = "paired, but saving failed: ${e.message}")
-            }
-        }
-        _state.value = _state.value.copy(message = "paired")
-        phase = "wait_challenge"
-    }
-
-    /** Rewrite a record saved with the pre-0.5.3 double-hashed fingerprint. */
-    private fun healLegacyPin() {
-        val info = pairInfo as? PairInfo.Paired ?: return
-        val observed = control?.observedFp ?: return
-        if (constTimeEqual(observed, info.pinnedFp)) return // already correct
-        val staleHex = info.pinnedFp.toHex()
-        scope.launch {
-            try {
-                val fixed = pairingStore.load().map {
-                    if (it.fingerprintHex == staleHex) it.copy(fingerprintHex = observed.toHex()) else it
-                }
-                pairingStore.save(fixed)
-                pairInfo = info.copy(pinnedFp = observed)
-                _pairingsVersion.value += 1
-            } catch (e: Exception) {
-                // Next connect heals it again; nothing to surface.
-            }
-        }
-    }
-
-    private fun onWelcome(o: JSONObject) {
-        healLegacyPin()
-        sessionId = o.getLong("session_id")
-        penPort = o.getInt("pen_port")
-        val salt = Base64.decode(o.getString("pen_key_salt"), Base64.DEFAULT)
-        val key = derivePenKey(b64(secretB64), salt)
-        sender?.stop()
-        sender = PenSender(
-            InetAddress.getByName(hostAddr), penPort, sessionId, key,
-            onSeqRollover = {
-                // Fresh session before seq reaches 0xFFFF0000 (spec 5).
-                control?.close()
-            },
-        )
-        penView?.sender = sender
-        penView?.newSession()
-        phase = "connected"
-        _state.value = ConnState("connected", o.optString("pc_name", hostAddr), "")
-        // Remember for auto-connect (auto device discovery).
-        scope.launch {
-            applicationContext.settingsStore.edit {
-                it[SettingsKeys.LAST_HOST] = hostAddr
-                it[SettingsKeys.LAST_PORT] = portSeen
-            }
-        }
-        audio.earcon("connect")
-        audio.speak("Connected to ${_state.value.pcName}")
-        updateNotification()
-        startMuteWatch()
     }
 
     private fun onProfile(o: JSONObject) {
-        val p = try {
-            parseStripProfile(o.getJSONObject("profile"))
-        } catch (e: Exception) {
-            return
-        }
+        val p = parseStripProfile(o.getJSONObject("profile"))
         _profile.value = p
         _toggleStates.value = emptyMap()
         val texts = p.buttons.map { it.speak.ifEmpty { it.label } } +
@@ -491,169 +288,130 @@ class ConnectionService : Service() {
                 listOf("$s on", "$s off")
             }
         audio.precache(texts)
-        if (o.optString("reason", "") == "app" || o.optString("reason", "") == "manual") {
-            audio.speak(p.name)
-        }
+        if (o.optString("reason") in setOf("app", "manual")) audio.speak(p.name)
     }
 
-    // ------------------------------------------------------------ UI calls
+    // ------------------------------------------------------------ state -> UI
 
-    fun sendButton(id: String, phaseMsg: String) {
-        control?.send(JSONObject().apply {
-            put("t", "button")
-            put("id", id)
-            put("phase", phaseMsg)
-        }.toString())
-    }
-
-    fun sendSurface(w: Int, h: Int) {
-        if (w > 0 && h > 0) {
-            surfaceW = w
-            surfaceH = h
+    private fun render(s: LinkState) {
+        _state.value = when (s) {
+            LinkState.Idle -> ConnState("disconnected", "", note)
+            is LinkState.Connecting -> ConnState("connecting", s.host, if (s.attempt > 0) "Trying again…" else "")
+            is LinkState.Pairing -> ConnState("connecting", s.host, "Pairing…")
+            is LinkState.Connected -> ConnState(
+                "connected", s.info.pcName,
+                if (muted) "Volume is muted: button feedback will not be heard." else "",
+            )
+            is LinkState.Retrying -> ConnState(
+                "reconnecting", lastPcName,
+                "Connection lost: ${s.reason}. Retrying in %.1f s.".format(s.retryInMs / 1000.0),
+            )
+            is LinkState.Failed -> ConnState(
+                "error", "", s.reason,
+                attemptsLeft = if (s.kind == FailKind.PairingFailed) s.attemptsLeft else 5,
+                mismatchHost = if (s.kind == FailKind.CertMismatch) s.host else "",
+            )
         }
-        control?.send(JSONObject().apply {
-            put("t", "surface")
-            put("w", w)
-            put("h", h)
-        }.toString())
-    }
-
-    /** Tablet panic gesture: stop UDP first, then bye, 5 s cooldown. */
-    fun panicDisconnect() {
-        sender?.stop()
-        sender = null
-        try {
-            control?.send("""{"t":"bye"}""")
-        } catch (e: Exception) {
-        }
-        disconnect("")
-        panicUntil = SystemClock.uptimeMillis() + PanicGesture.RECONNECT_COOLDOWN_MS
-        _state.value = ConnState("disconnected", "", "panic disconnect")
-    }
-
-    /** After the user forgets a PC: drop a stale error/mismatch banner. */
-    fun clearError() {
-        if (_state.value.status == "error") _state.value = ConnState()
-    }
-
-    fun disconnect(reason: String) {
-        wantStop = true
-        connectJob?.cancel()
-        try {
-            if (reason == "bye") control?.send("""{"t":"bye"}""")
-        } catch (e: Exception) {
-        }
-        control?.close()
-        control = null
-        sender?.stop()
-        sender = null
-        penView?.sender = null
-        muteJob?.cancel()
-        // Release local holds: fresh TouchMachines on next session.
-        _toggleStates.value = emptyMap()
-        if (_state.value.status == "connected") {
-            _state.value = ConnState("disconnected", "", "")
-            audio.speak("Disconnected")
-            audio.earcon("disconnect")
-        } else if (reason.isNotEmpty()) {
-            _state.value = ConnState("disconnected", "", reason)
-        }
-        releaseLocks()
-        phase = "idle"
+        updateNotification(
+            when (s) {
+                is LinkState.Connected -> "Connected to ${s.info.pcName}"
+                is LinkState.Retrying -> "Reconnecting…"
+                is LinkState.Failed -> "Not connected"
+                else -> "Not connected"
+            },
+        )
     }
 
     private fun startMuteWatch() {
         muteJob?.cancel()
         muteJob = scope.launch {
-            if (audio.isMuted()) {
-                _state.value = _state.value.copy(message = "Volume is muted: button feedback will not be heard.")
-            }
-            while (_state.value.status == "connected") {
-                delay(30000)
-                if (audio.isMuted()) {
-                    _state.value = _state.value.copy(message = "Volume is muted: button feedback will not be heard.")
+            while (true) {
+                val now = audio.isMuted()
+                if (now != muted) {
+                    muted = now
+                    render(connector.state.value)
                 }
+                delay(30_000)
             }
         }
     }
 
-    // ------------------------------------------------------------ service
+    // ------------------------------------------------------------ Android plumbing
 
-    private fun b64(s: String): ByteArray = Base64.decode(s, Base64.DEFAULT)
-
-    private fun holdLocks() {
-        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        @Suppress("DEPRECATION")
-        val mode = try {
-            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-        } catch (e: Exception) {
-            WifiManager.WIFI_MODE_FULL_HIGH_PERF
-        }
-        wifiLock = wm.createWifiLock(mode, "chiz:pen").apply { acquire() }
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "chiz:pen").apply { acquire() }
+    private fun PairInfo.toAuth(): Auth = when (this) {
+        is PairInfo.Paired -> Auth.Paired(Base64.getDecoder().decode(secretB64), pinnedFp)
+        is PairInfo.Qr -> Auth.Qr(Base64.getDecoder().decode(tokenB64), pinnedFp)
+        is PairInfo.Pin -> Auth.Pin(pin)
     }
 
+    @Synchronized
+    private fun holdLocks() {
+        releaseLocks()
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "chiz:pen").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "chiz:pen").apply {
+            setReferenceCounted(false)
+            acquire(6 * 60 * 60 * 1000L) // a long drawing session; released on disconnect
+        }
+    }
+
+    @Synchronized
     private fun releaseLocks() {
         try {
-            wifiLock?.release()
+            wifiLock?.takeIf { it.isHeld }?.release()
         } catch (e: Exception) {
         }
         wifiLock = null
         try {
-            wakeLock?.release()
+            wakeLock?.takeIf { it.isHeld }?.release()
         } catch (e: Exception) {
         }
         wakeLock = null
     }
 
     private fun createChannel() {
-        if (Build.VERSION.SDK_INT >= 26) {
-            val ch = NotificationChannel("chiz", "Chiz", NotificationManager.IMPORTANCE_LOW)
-            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
-        }
+        val ch = NotificationChannel(CHANNEL, "Chiz", NotificationManager.IMPORTANCE_LOW)
+        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
     }
 
     private fun notification(text: String): Notification {
-        val pi = PendingIntent.getActivity(
+        val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val stop = PendingIntent.getService(
-            this, 1, Intent(this, ConnectionService::class.java).setAction("DISCONNECT"),
+            this, 1, Intent(this, ConnectionService::class.java).setAction(ACTION_DISCONNECT),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        return NotificationCompat.Builder(this, "chiz")
+        return NotificationCompat.Builder(this, CHANNEL)
             .setContentTitle("Chiz")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentIntent(pi)
+            .setSmallIcon(xyz.chiz.tablet.R.drawable.ic_logo_mono)
+            .setContentIntent(open)
             .addAction(0, "Disconnect", stop)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .build()
     }
 
-    private fun updateNotification() {
-        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-            .notify(1, notification("Connected to ${_state.value.pcName}"))
+    @Volatile private var shownText = ""
+
+    private fun updateNotification(text: String) {
+        if (text == shownText) return
+        shownText = text
+        try {
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(1, notification(text))
+        } catch (e: SecurityException) {
+            // POST_NOTIFICATIONS denied: the foreground service still runs.
+        }
     }
 
-    fun setPenRangeListener(fn: (Boolean) -> Unit) {
-        // Wired to StripView button-guard via the drawing screen.
-        penRangeListener = fn
+    companion object {
+        private const val CHANNEL = "chiz"
+        private const val ACTION_DISCONNECT = "xyz.chiz.tablet.DISCONNECT"
     }
-
-    private var penRangeListener: ((Boolean) -> Unit)? = null
-
-    fun attachSender(range: (Boolean) -> Unit) {
-        penRangeListener = range
-    }
-
-    override fun onDestroy() {
-        scope.cancel()
-        disconnect("")
-        audio.stop()
-        super.onDestroy()
-    }
-
 }

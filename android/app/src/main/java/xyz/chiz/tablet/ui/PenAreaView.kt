@@ -21,7 +21,8 @@ class PenAreaView @JvmOverloads constructor(
     attrs: AttributeSet? = null,
 ) : View(context, attrs) {
 
-    var sender: PenSender? = null
+    /** Set from the connection service's thread; read on the UI thread. */
+    @Volatile var sender: PenSender? = null
     var onRange: ((Boolean) -> Unit)? = null
     private var stylusId = -1
     private var sessionStart = 0L
