@@ -502,6 +502,11 @@ class ConnectionService : Service() {
         _state.value = ConnState("disconnected", "", "panic disconnect")
     }
 
+    /** After the user forgets a PC: drop a stale error/mismatch banner. */
+    fun clearError() {
+        if (_state.value.status == "error") _state.value = ConnState()
+    }
+
     fun disconnect(reason: String) {
         wantStop = true
         connectJob?.cancel()

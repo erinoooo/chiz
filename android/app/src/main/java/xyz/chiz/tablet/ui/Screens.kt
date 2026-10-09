@@ -204,6 +204,7 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
     var sheet by remember { mutableStateOf<String?>(null) } // qr|pin|manual
     var state by remember { mutableStateOf(ConnState()) }
     var autoTried by remember { mutableStateOf(false) }
+    var saveFailed by remember { mutableStateOf(false) }
     val store = remember { PairingStore(ctx) }
     val discovery = remember {
         Discovery(ctx) { name, host, port -> found = found + (name to (host to port)) }
@@ -311,11 +312,13 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
                         if (isError && bad != null) {
                             Button(onClick = {
                                 scope.launch {
-                                    try {
-                                        store.save(paired.filter { it.pcId != bad.pcId })
-                                    } catch (e: Exception) {
+                                    val next = paired.filter { it.pcId != bad.pcId }
+                                    if (forgetPc(ctx, store, next)) {
+                                        paired = next
+                                        activity.svcState.value?.clearError()
+                                    } else {
+                                        saveFailed = true
                                     }
-                                    paired = paired.filter { it.pcId != bad.pcId }
                                 }
                             }) { Text("Forget ${bad.name} and re-pair") }
                         }
@@ -370,11 +373,12 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
                         TextButton(onClick = {
                             val next = paired.filter { it.pcId != pc.pcId }
                             scope.launch {
-                                try {
-                                    store.save(next)
-                                } catch (e: Exception) {
+                                if (forgetPc(ctx, store, next)) {
+                                    paired = next
+                                    activity.svcState.value?.clearError()
+                                } else {
+                                    saveFailed = true
                                 }
-                                paired = next
                             }
                         }) { Text("Forget", color = ChizColors.Danger) }
                     }
@@ -405,6 +409,14 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
         }
     }
 
+    if (saveFailed) {
+        AlertDialog(
+            onDismissRequest = { saveFailed = false },
+            title = { Text("Could not forget this PC") },
+            text = { Text("Saving the change failed, so the PC is still remembered. Try again, or clear the app's storage in Android settings.") },
+            confirmButton = { TextButton(onClick = { saveFailed = false }) { Text("OK") } },
+        )
+    }
     when (sheet) {
         "qr" -> AlertDialog(
             onDismissRequest = { sheet = null },
@@ -500,6 +512,21 @@ fun ManualSheet(onPick: (String, Int) -> Unit, onDismiss: () -> Unit) {
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
+}
+
+/** Persist the list without the forgotten PC, and forget where we last were. */
+private suspend fun forgetPc(ctx: Context, store: PairingStore, remaining: List<PairedPc>): Boolean {
+    return try {
+        store.save(remaining)
+        // Auto-connect must not chase the PC the user just removed.
+        ctx.settingsStore.edit {
+            it.remove(SettingsKeys.LAST_HOST)
+            it.remove(SettingsKeys.LAST_PORT)
+        }
+        true
+    } catch (e: Exception) {
+        false
+    }
 }
 
 fun hexToBytes(h: String): ByteArray = ByteArray(h.length / 2) { h.substring(it * 2, it * 2 + 2).toInt(16).toByte() }

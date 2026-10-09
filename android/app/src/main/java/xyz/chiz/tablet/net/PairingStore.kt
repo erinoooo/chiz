@@ -37,6 +37,17 @@ class PairingStore(private val context: Context) {
 
     fun load(): List<PairedPc> {
         if (!file.exists()) return emptyList()
+        return try {
+            read()
+        } catch (e: Exception) {
+            // Corrupt, or the Keystore key was lost (restore/reset): the
+            // records can never authenticate, so start clean.
+            file.delete()
+            emptyList()
+        }
+    }
+
+    private fun read(): List<PairedPc> {
         val bytes = ByteArrayOutputStream().also { out ->
             encryptedFile().openFileInput().use { it.copyTo(out) }
         }.toByteArray()
@@ -60,6 +71,13 @@ class PairingStore(private val context: Context) {
                 put("hosts", JSONArray(p.hosts))
             })
         }
-        encryptedFile().openFileOutput().use { it.write(arr.toString().toByteArray()) }
+        // EncryptedFile refuses to overwrite: openFileOutput() throws if the
+        // file exists, so every save after the first used to fail silently
+        // (forget "worked" on screen but never reached disk, and re-pairing
+        // could not store its secret). The file name is bound into the
+        // encryption, so write in place after deleting, not via rename.
+        val bytes = arr.toString().toByteArray()
+        if (file.exists() && !file.delete()) throw java.io.IOException("cannot replace ${file.name}")
+        encryptedFile().openFileOutput().use { it.write(bytes) }
     }
 }

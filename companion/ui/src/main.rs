@@ -161,13 +161,93 @@ impl Config {
     }
 }
 
-/// Paired tablets: device_id -> 32-byte secret. Backed by paired.json
-/// (DPAPI on Windows / 0600 file on Linux per spec 9-10); in-memory here
-/// with a loader hook.
+/// Paired tablets: device_id -> 32-byte secret, persisted to `paired.json`
+/// in the data dir (0600 on Unix; the per-user %APPDATA% ACL on Windows).
+/// Without persistence every restart silently un-paired every tablet.
 #[derive(Default)]
 struct PairedStore {
     secrets: HashMap<String, [u8; 32]>,
     names: HashMap<String, String>,
+}
+
+impl PairedStore {
+    fn path() -> std::path::PathBuf {
+        identity::data_dir().join("paired.json")
+    }
+
+    fn load() -> Self {
+        let p = Self::path();
+        let store = Self::load_from(&p);
+        if !store.secrets.is_empty() {
+            eprintln!("paired tablets: {} loaded", store.secrets.len());
+        }
+        store
+    }
+
+    fn load_from(path: &std::path::Path) -> Self {
+        let mut me = Self::default();
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return me;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            eprintln!(
+                "{} is unreadable; starting with no paired tablets",
+                path.display()
+            );
+            return me;
+        };
+        for (id, e) in v.as_object().into_iter().flatten() {
+            let secret = e
+                .get("secret")
+                .and_then(|s| s.as_str())
+                .and_then(|s| base64_b64_decode(s).ok())
+                .filter(|b| b.len() == 32);
+            if let Some(b) = secret {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                me.secrets.insert(id.clone(), arr);
+                let name = e.get("name").and_then(|n| n.as_str()).unwrap_or("tablet");
+                me.names.insert(id.clone(), name.to_string());
+            }
+        }
+        me
+    }
+
+    fn save(&self) {
+        if let Err(e) = self.save_to(&Self::path()) {
+            banner(&format!("could not save paired tablets: {e}"));
+        }
+    }
+
+    /// Write-then-rename so a crash never leaves a half-written file.
+    fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let mut obj = serde_json::Map::new();
+        for (id, secret) in &self.secrets {
+            obj.insert(
+                id.clone(),
+                serde_json::json!({
+                    "secret": base64_b64(secret),
+                    "name": self.names.get(id).cloned().unwrap_or_default(),
+                }),
+            );
+        }
+        let body = serde_json::to_vec_pretty(&serde_json::Value::Object(obj))?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        {
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+            let mut f = opts.open(&tmp)?;
+            f.write_all(&body)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
 }
 
 /// Constant-time equality (spec 12.2). No early exit on mismatch.
@@ -858,6 +938,7 @@ where
                         let mut ps = shared.paired.lock().await;
                         ps.secrets.insert(device_id.clone(), secret);
                         ps.names.insert(device_id, device_name.clone());
+                        ps.save();
                     }
                     drop(ps);
                     shared.pairing.lock().await.window.record_success();
@@ -1279,7 +1360,7 @@ async fn setup() -> Boot {
         auth: Mutex::new(control::AuthTracker::default()),
         unauth_count: Mutex::new(0),
         pairing: Mutex::new(pairing::PairingState::closed()),
-        paired: Mutex::new(PairedStore::default()),
+        paired: Mutex::new(PairedStore::load()),
         fp: id.fingerprint,
         pen_key: Mutex::new(HashMap::new()),
         pen_rx: Mutex::new(HashMap::new()),
@@ -1529,6 +1610,40 @@ async fn accept_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paired_store_survives_restart_and_forget() {
+        let dir = std::env::temp_dir().join(format!("chiz-paired-{}", std::process::id()));
+        let path = dir.join("paired.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut a = PairedStore::default();
+        a.secrets.insert("dev-1".into(), [7u8; 32]);
+        a.names.insert("dev-1".into(), "Tab S9".into());
+        a.secrets.insert("dev-2".into(), [9u8; 32]);
+        a.save_to(&path).unwrap();
+        let b = PairedStore::load_from(&path);
+        assert_eq!(b.secrets.get("dev-1"), Some(&[7u8; 32]));
+        assert_eq!(b.names.get("dev-1").map(String::as_str), Some("Tab S9"));
+        assert_eq!(b.secrets.len(), 2);
+        // Forget, save, reload: really gone.
+        let mut c = b;
+        c.secrets.remove("dev-1");
+        c.names.remove("dev-1");
+        c.save_to(&path).unwrap();
+        let d = PairedStore::load_from(&path);
+        assert!(!d.secrets.contains_key("dev-1") && d.secrets.contains_key("dev-2"));
+        // Corrupt file: starts empty instead of crashing.
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(PairedStore::load_from(&path).secrets.is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            d.save_to(&path).unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn qr_hosts_skip_loopback_and_rank_lan_first() {

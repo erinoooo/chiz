@@ -248,6 +248,7 @@ impl GuiApp {
                     let mut paired = self.shared.paired.blocking_lock();
                     paired.secrets.remove(&id);
                     paired.names.remove(&id);
+                    paired.save();
                 }
                 // Single-tablet design: forgetting drops all live pen state.
                 // The orphaned socket reaps on the 5 s liveness deadline.
