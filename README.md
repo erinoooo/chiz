@@ -119,7 +119,25 @@ A self-contained JDK 17 + Android SDK + Gradle can live in the gitignored
 Windows installer notes: `companion/packaging/`.
 
 There is no hosted CI; everything builds locally. `scripts/release.sh`
-runs fmt, `clippy -D warnings` and every test suite before building.
+runs fmt, `clippy -D warnings` and every test suite before building,
+including `scripts/e2e.sh`: the tablet's real connection code (Kotlin, on
+the JVM) against the real PC binary, covering pairing, reconnects, PC
+restarts, session replacement and certificate pinning.
+
+### Connection architecture
+
+- **PC** (`companion/ui/src`): `hub.rs` is the single owner of session,
+  pairing and auth state (one tablet at a time; everything belonging to a
+  session lives and dies together). `server.rs` runs one task per
+  connection around a single `select!` over the socket, an outbox channel
+  and a deadline tick. All shared state is behind short-held std mutexes
+  that are never held across an await, so the GUI and the panic hotkey call
+  plain synchronous functions.
+- **Tablet** (`android/.../net`): `ControlLink` is one TLS connection with a
+  reader coroutine and a single writer coroutine (no socket I/O on the UI
+  thread, ever). `Connector` runs the handshake as sequential code with a
+  typed state machine; each attempt owns its link, and a generation counter
+  keeps a cancelled attempt from touching its successor.
 Cutting a release: run `scripts/release.sh vX.Y.Z`. It verifies, builds the
 Linux and Windows companions plus the Android APK, tags, and publishes a
 GitHub Release with checksums (`--dry` builds into `dist/` only). The APK is

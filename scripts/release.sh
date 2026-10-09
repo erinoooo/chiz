@@ -16,6 +16,16 @@ echo "==> verify"
 python3 protocol/verify_m0.py | tail -1
 python3 protocol/verify_m1m2.py | tail -1
 
+echo "==> kotlin protocol tests"
+KT_OUT="${TMPDIR:-/tmp}/chiz-kt" && rm -rf "$KT_OUT" && mkdir -p "$KT_OUT"
+KCP=.toolchain/jvmlibs/kotlin-stdlib.jar:.toolchain/jvmlibs/json.jar
+.toolchain/kotlinc/bin/kotlinc android/app/src/main/java/xyz/chiz/tablet/proto/*.kt \
+  android/jvmtest/TestMain.kt -cp "$KCP" -d "$KT_OUT" 2>&1 | grep -v '^warning' || true
+java -cp "$KT_OUT:$KCP" xyz.chiz.tablet.jvmtest.TestMainKt | tail -1 | grep -q "FAILURES: none"
+
+echo "==> end-to-end: tablet connection code vs the PC binary"
+scripts/e2e.sh | tail -1 | grep -q "ALL PASSED"
+
 rm -rf dist && mkdir dist
 
 echo "==> linux"
