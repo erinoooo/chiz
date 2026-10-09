@@ -19,3 +19,6 @@ pair_qr.pbm
 # Logs and scratch
 *.log
 .DS_Store
+# Local build toolchain (JDK, Android SDK, Gradle)
+.toolchain/
+dist/

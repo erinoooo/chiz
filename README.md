@@ -4,8 +4,6 @@
 
 # Chiz
 
-[![build-and-release](https://github.com/erinoooo/chiz/actions/workflows/release.yml/badge.svg)](https://github.com/erinoooo/chiz/actions/workflows/release.yml)
-
 </div>
 
 Chiz turns an Android tablet into a **screenless pen tablet** for a Windows or
@@ -75,6 +73,15 @@ The default profile gives you an 8-button strip: Undo, Redo, Brush, Eraser
 `companion/profiles/` — copy one to share it. Buttons can tap, hold
 (modifiers), toggle, click the mouse, run short macros, or switch profiles.
 
+## Configuration
+
+Optional `config.json` (see `companion/config.example.json`). The companion
+reads, in order: `$CHIZ_CONFIG`, `config.json` in its data directory
+(`$XDG_CONFIG_HOME/chiz` or `~/.config/chiz` on Linux, `%APPDATA%\Chiz` on
+Windows; override with `CHIZ_DATA_DIR`), then `config.json`
+next to the executable. Missing file = defaults; a broken file is reported
+and ignored. Out-of-range ports fall back to the defaults (47800 / 47801).
+
 ## Security model
 
 - Pairing is explicit and short-lived; every tablet gets its own secret.
@@ -88,7 +95,7 @@ The default profile gives you an 8-button strip: Undo, Redo, Brush, Eraser
 ```text
 protocol/    wire-format reference + test vectors (Python)
 companion/   PC program (Rust): core protocol, Windows + Linux injectors,
-             networking/pairing/profiles runtime, egui screens, tray model
+             networking/pairing/profiles runtime, egui window
 android/     tablet app (Kotlin): pen capture, button strip, audio feedback,
              TLS + pairing, Compose screens
 docs/        research notes, failsafe guide, user notes
@@ -107,10 +114,17 @@ java -cp "/tmp/kt-out:<kotlinc>/lib/kotlin-stdlib.jar" xyz.chiz.tablet.jvmtest.T
 ```
 
 Full Android APK: open `android/` in Android Studio (or `gradle :app:assembleDebug`).
+A self-contained JDK 17 + Android SDK + Gradle can live in the gitignored
+`.toolchain/` folder; `. .toolchain/env.sh` puts them on your PATH.
 Windows installer notes: `companion/packaging/`.
 
-Cutting a release: push a tag — `git tag v1.0.0 && git push origin v1.0.0` —
-and CI attaches the Linux + Windows companions and the debug APK.
+There is no hosted CI; everything builds locally. `scripts/release.sh`
+runs fmt, `clippy -D warnings` and every test suite before building.
+Cutting a release: run `scripts/release.sh vX.Y.Z`. It verifies, builds the
+Linux and Windows companions plus the Android APK, tags, and publishes a
+GitHub Release with checksums (`--dry` builds into `dist/` only). The APK is
+signed with the keystore named in `.toolchain/signing.env` (gitignored; back
+it up, because updates must be signed with the same key).
 
 ## Status & roadmap
 
@@ -118,6 +132,10 @@ Working now: pairing (QR + PIN), encrypted pen with pressure/tilt/hover/
 eraser/barrel, per-app profiles, button strip with speech + earcons, panic
 switches, mapping + pressure curves, Linux + Windows injection, mDNS.
 
-Still to wire on a display host: the `eframe` runner and tray icon loop
-(screens and menu model are done), then device testing per the acceptance
-suite in the spec. After v1: screen streaming, USB transport, macOS, relay.
+Per-app auto-switching works on Windows and X11 sessions (Wayland has no
+portable focused-window API, so use the manual profile lock there). The
+global panic hotkey needs Windows or X11/XWayland; on pure Wayland use the
+window's Emergency release button or the tablet's 3-finger tap.
+
+Next: device testing per the acceptance suite in the spec. After v1: screen
+streaming, USB transport, macOS, relay.
