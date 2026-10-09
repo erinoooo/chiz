@@ -246,7 +246,11 @@ fun ConnectScreen(activity: MainActivity, onConnected: () -> Unit) {
                 paired = try {
                     // Drop corrupt/blank records: they can never authenticate
                     // and would only produce fingerprint mismatches.
-                    store.load().filter { it.secretB64.isNotBlank() && it.fingerprintHex.isNotBlank() }
+                    store.load()
+                        .filter { it.secretB64.isNotBlank() && it.fingerprintHex.isNotBlank() }
+                        // Older builds could leave a stale duplicate behind a
+                        // re-pair; the newest record (saved last) wins.
+                        .asReversed().distinctBy { it.pcId }.asReversed()
                 } catch (e: Exception) {
                     emptyList()
                 }

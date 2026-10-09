@@ -199,6 +199,8 @@ class ConnectionService : Service() {
         }
         if (info is PairInfo.Paired) secretB64 = info.secretB64
         var lastErr: Exception? = null
+        var mismatch: CertMismatch? = null
+        var mismatchAt = ""
         for (host in hosts) {
             if (wantStop) throw StopLoop()
             hostAddr = host
@@ -214,12 +216,20 @@ class ConnectionService : Service() {
                 if (e.message?.contains("fingerprint mismatch") == true ||
                     e.cause?.message?.contains("fingerprint mismatch") == true
                 ) {
+                    // Another machine (or a stale entry) may own this address;
+                    // keep trying the rest of the list before giving up.
                     val want = pinned?.let { fpShort(it) } ?: "?"
                     val got = ch.observedFp?.let { fpShort(it) } ?: "?"
-                    throw CertMismatch(
-                        "Certificate mismatch (tablet expects $want, PC showed $got). " +
-                            "The PC's certificate changed — forget this PC and pair again.",
-                    )
+                    if (mismatch == null) {
+                        mismatch = CertMismatch(
+                            "Certificate mismatch at $host (tablet expects $want, the device " +
+                                "there showed $got). Check the Tablets page on the PC: its " +
+                                "certificate id must be $want. Otherwise forget this PC and pair again.",
+                        )
+                        mismatchAt = host
+                    }
+                    lastErr = mismatch
+                    continue
                 }
                 lastErr = Exception("connect $host failed: ${e.message}")
                 continue
@@ -238,6 +248,10 @@ class ConnectionService : Service() {
             // Dead transport (mid-session drop or pre-welcome loss):
             // retry with the next host, then the whole list.
             lastErr = Exception("connection lost")
+        }
+        mismatch?.let {
+            hostAddr = mismatchAt
+            throw it
         }
         throw lastErr ?: Exception("no route to PC")
     }
@@ -386,8 +400,15 @@ class ConnectionService : Service() {
                     secretB64 = secretB64,
                     hosts = listOf(hostAddr),
                 )
-                val cur = pairingStore.load().filter { it.fingerprintHex != fpHex || fpHex.isEmpty() }
-                pairingStore.save(cur + rec)
+                // A re-pair must REPLACE the old record for this PC. Keeping the
+                // stale one (old fingerprint, same host:port) made every later
+                // connect pin the dead certificate: permanent "mismatch".
+                val cur = pairingStore.load().filter {
+                    it.pcId != rec.pcId &&
+                        hostAddr !in it.hosts &&
+                        (fpHex.isEmpty() || it.fingerprintHex != fpHex)
+                }
+                pairingStore.save(listOf(rec) + cur)
                 _pairingsVersion.value += 1
             } catch (e: Exception) {
                 _state.value = _state.value.copy(message = "paired, but saving failed: ${e.message}")

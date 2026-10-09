@@ -1141,21 +1141,49 @@ fn now_secs() -> f64 {
 
 /// Local IPv4 addresses for the QR `h` list (default-route address first).
 fn local_ipv4_hosts() -> Vec<String> {
-    let mut hosts = vec![];
-    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        // No packets sent: connect() only selects the default route.
-        if sock.connect("192.0.2.1:80").is_ok() {
-            if let Ok(addr) = sock.local_addr() {
-                if let std::net::IpAddr::V4(v4) = addr.ip() {
-                    if !v4.is_loopback() {
-                        hosts.push(v4.to_string());
-                    }
-                }
+    // The address the OS would use to reach the LAN goes first.
+    let default_route = std::net::UdpSocket::bind("0.0.0.0:0")
+        .ok()
+        .and_then(|sock| {
+            // No packets sent: connect() only selects the default route.
+            sock.connect("192.0.2.1:80").ok()?;
+            match sock.local_addr().ok()?.ip() {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                _ => None,
             }
+        });
+    let mut all: Vec<std::net::Ipv4Addr> = default_route.into_iter().collect();
+    if let Ok(ifs) = if_addrs::get_if_addrs() {
+        all.extend(ifs.into_iter().filter_map(|i| match i.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            _ => None,
+        }));
+    }
+    rank_lan_hosts(all)
+}
+
+/// Keep only addresses a tablet could actually reach (never loopback, which
+/// would be the tablet itself, nor link-local/unspecified), de-duplicated.
+/// Home-LAN ranges sort before 172.16/12, where WSL, Docker and Hyper-V
+/// virtual adapters live, so the real LAN address is tried first.
+fn rank_lan_hosts(addrs: Vec<std::net::Ipv4Addr>) -> Vec<String> {
+    let mut out: Vec<std::net::Ipv4Addr> = vec![];
+    for a in addrs {
+        let usable =
+            !a.is_loopback() && !a.is_link_local() && !a.is_unspecified() && !a.is_broadcast();
+        if usable && !out.contains(&a) {
+            out.push(a);
         }
     }
-    hosts.push("127.0.0.1".into());
-    hosts
+    let rank = |a: &std::net::Ipv4Addr| match a.octets() {
+        [192, 168, ..] => 0,
+        [10, ..] => 1,
+        [172, 16..=31, ..] => 3,
+        _ => 2,
+    };
+    out.sort_by_key(rank); // stable: the default-route address stays first within its class
+    out.truncate(4);
+    out.iter().map(|a| a.to_string()).collect()
 }
 
 /// Push the current profile to every live tablet (manual/app switches).
@@ -1501,6 +1529,20 @@ async fn accept_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qr_hosts_skip_loopback_and_rank_lan_first() {
+        let ip = |s: &str| s.parse::<std::net::Ipv4Addr>().unwrap();
+        let got = rank_lan_hosts(vec![
+            ip("172.24.46.253"),
+            ip("127.0.0.1"),
+            ip("169.254.3.4"),
+            ip("192.168.1.20"),
+            ip("192.168.1.20"),
+            ip("10.0.0.5"),
+        ]);
+        assert_eq!(got, vec!["192.168.1.20", "10.0.0.5", "172.24.46.253"]);
+    }
 
     /// Regression: several control messages in one TCP segment must all
     /// decode without waiting for more socket data (old code read the

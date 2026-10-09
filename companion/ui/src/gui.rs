@@ -24,6 +24,7 @@ pub struct GuiApp {
     qr_tex: Option<egui::TextureHandle>,
     qr_mtime: Option<std::time::SystemTime>,
     pushed_view: Option<ViewKey>,
+    hosts_at: Option<std::time::Instant>,
     #[cfg(debug_assertions)]
     shot_frame: u32,
 }
@@ -50,6 +51,7 @@ impl GuiApp {
             qr_tex: None,
             qr_mtime: None,
             pushed_view: None,
+            hosts_at: None,
             #[cfg(debug_assertions)]
             shot_frame: 0,
         };
@@ -187,6 +189,16 @@ impl GuiApp {
                 .collect();
             v.sort();
             self.app.tablets.paired = v;
+        }
+        // This PC's identity, for comparing with the tablet's mismatch text.
+        self.app.tablets.cert_id = super::identity::fp_hex(&self.fp).chars().take(8).collect();
+        if self.app.screen == super::screens::Screen::Tablets
+            && self
+                .hosts_at
+                .is_none_or(|t| t.elapsed() > Duration::from_secs(5))
+        {
+            self.app.tablets.hosts = super::local_ipv4_hosts();
+            self.hosts_at = Some(std::time::Instant::now());
         }
         // Settings snapshot.
         self.app.mapping.monitors = vec!["primary".to_string(), "all".to_string()];

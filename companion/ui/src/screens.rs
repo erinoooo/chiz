@@ -135,6 +135,11 @@ pub struct TabletsView {
     pub pairing_open: bool,
     pub countdown_s: u64,
     pub pin: String,
+    /// First 8 hex of this PC's certificate fingerprint (what the tablet
+    /// shows in a mismatch message).
+    pub cert_id: String,
+    /// Addresses the tablet can try, best first.
+    pub hosts: Vec<String>,
     pub qr_tex: Option<egui::TextureHandle>,
 }
 
@@ -750,6 +755,32 @@ impl CompanionApp {
                 });
             });
         }
+        theme::card(ui, |ui| {
+            theme::section(ui, "This PC");
+            egui::Grid::new("thispc")
+                .num_columns(2)
+                .spacing([24.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label(theme::dim("Certificate id"));
+                    ui.label(
+                        egui::RichText::new(&self.tablets.cert_id)
+                            .monospace()
+                            .color(theme::AMBER),
+                    );
+                    ui.end_row();
+                    ui.label(theme::dim("Reachable at"));
+                    ui.label(egui::RichText::new(self.tablets.hosts.join(", ")).monospace());
+                    ui.end_row();
+                });
+            ui.label(
+                theme::dim(
+                    "If the tablet says \"certificate mismatch\", its message names the id it \
+                     expects; it must equal the id above. A different id means the tablet \
+                     reached another device, or holds an old pairing: forget it and pair again.",
+                )
+                .small(),
+            );
+        });
         theme::card(ui, |ui| {
             theme::section(ui, "Paired tablets");
             let paired = self.tablets.paired.clone();
