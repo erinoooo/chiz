@@ -29,9 +29,12 @@ import org.json.JSONObject
 import xyz.chiz.tablet.proto.PanicGesture
 import xyz.chiz.tablet.proto.StripProfile
 import xyz.chiz.tablet.proto.computeAuth
+import xyz.chiz.tablet.proto.constTimeEqual
 import xyz.chiz.tablet.proto.computePinProof
 import xyz.chiz.tablet.proto.derivePenKey
 import xyz.chiz.tablet.proto.parseStripProfile
+import xyz.chiz.tablet.proto.pinMatches
+import xyz.chiz.tablet.proto.toHex
 import xyz.chiz.tablet.proto.reconnectDelay
 import xyz.chiz.tablet.ui.SettingsKeys
 import xyz.chiz.tablet.ui.settingsStore
@@ -389,8 +392,10 @@ class ConnectionService : Service() {
         scope.launch {
             try {
                 val fpHex = when (val info = pairInfo) {
-                    is PairInfo.Qr -> fpHex(info.pinnedFp)
-                    is PairInfo.Pin -> control?.observedFp?.let { fpHex(it) } ?: ""
+                    // Both values are already SHA-256(cert). Hashing them again
+                    // (the old fpHex) made every later reconnect "mismatch".
+                    is PairInfo.Qr -> info.pinnedFp.toHex()
+                    is PairInfo.Pin -> control?.observedFp?.toHex() ?: ""
                     else -> ""
                 }
                 val rec = PairedPc(
@@ -418,7 +423,28 @@ class ConnectionService : Service() {
         phase = "wait_challenge"
     }
 
+    /** Rewrite a record saved with the pre-0.5.3 double-hashed fingerprint. */
+    private fun healLegacyPin() {
+        val info = pairInfo as? PairInfo.Paired ?: return
+        val observed = control?.observedFp ?: return
+        if (constTimeEqual(observed, info.pinnedFp)) return // already correct
+        val staleHex = info.pinnedFp.toHex()
+        scope.launch {
+            try {
+                val fixed = pairingStore.load().map {
+                    if (it.fingerprintHex == staleHex) it.copy(fingerprintHex = observed.toHex()) else it
+                }
+                pairingStore.save(fixed)
+                pairInfo = info.copy(pinnedFp = observed)
+                _pairingsVersion.value += 1
+            } catch (e: Exception) {
+                // Next connect heals it again; nothing to surface.
+            }
+        }
+    }
+
     private fun onWelcome(o: JSONObject) {
+        healLegacyPin()
         sessionId = o.getLong("session_id")
         penPort = o.getInt("pen_port")
         val salt = Base64.decode(o.getString("pen_key_salt"), Base64.DEFAULT)
@@ -627,9 +653,4 @@ class ConnectionService : Service() {
         super.onDestroy()
     }
 
-    companion object {
-        /** SHA-256 hex of a DER cert, for matching QR fingerprints. */
-        fun fpHex(der: ByteArray): String =
-            MessageDigest.getInstance("SHA-256").digest(der).joinToString("") { "%02x".format(it) }
-    }
 }

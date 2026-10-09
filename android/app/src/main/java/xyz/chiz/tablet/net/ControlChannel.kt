@@ -47,7 +47,7 @@ class ControlChannel(
                 val fp = MessageDigest.getInstance("SHA-256").digest(der)
                 observedFp = fp
                 val pinned = pinnedFp
-                if (pinned != null && !constTimeEqual(fp, pinned)) {
+                if (pinned != null && !pinMatches(fp, pinned)) {
                     throw java.security.cert.CertificateException("fingerprint mismatch")
                 }
             }

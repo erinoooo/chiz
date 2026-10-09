@@ -47,6 +47,13 @@ fun main() {
     )
 
     // --- mapping cases (spec 13)
+    // Pinning: a record must match the real SHA-256(cert) fingerprint, and the
+    // double-hashed form that old builds saved must still be recognised.
+    val realFp = sha256(byteArrayOf(1, 2, 3))
+    check("pin-exact", pinMatches(realFp, realFp))
+    check("pin-legacy-double-hash", pinMatches(realFp, sha256(realFp)))
+    check("pin-wrong-cert", !pinMatches(sha256(byteArrayOf(9)), realFp) && !pinMatches(sha256(byteArrayOf(9)), sha256(realFp)))
+    check("pin-hex-roundtrip", hexToBytes(realFp.toHex()).contentEquals(realFp))
     check("tilt-sign", androidTiltToDegrees(0.3f, 0f).first == 0)
     val curves = listOf(
         doubleArrayOf(0.25, 0.25, 0.75, 0.75) to listOf(0.25, 0.5, 0.75),

@@ -51,6 +51,18 @@ fun computePinProof(pin: String, fpSeen: ByteArray, nonce: ByteArray, deviceId: 
 
 fun constTimeEqual(a: ByteArray, b: ByteArray): Boolean = MessageDigest.isEqual(a, b)
 
+fun sha256(data: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(data)
+
+/**
+ * Does the certificate fingerprint [observed] satisfy the stored pin?
+ * Builds up to 0.5.2 saved SHA-256(SHA-256(cert)) instead of SHA-256(cert),
+ * so those records could never match again. Accept that form too (same
+ * strength: a forged cert would need the same double-hash) and let the
+ * caller rewrite the record with [observed].
+ */
+fun pinMatches(observed: ByteArray, pinned: ByteArray): Boolean =
+    constTimeEqual(observed, pinned) || constTimeEqual(sha256(observed), pinned)
+
 fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
 fun hexToBytes(h: String): ByteArray =
